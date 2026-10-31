@@ -1,5 +1,5 @@
 bundle:
-  name: databricks-bundles
+  name: credicorp-hack
 
 include:
   - resources/*.yml

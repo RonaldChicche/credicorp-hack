@@ -1,4 +1,4 @@
-# databricks-bundles
+# credicorp-hack
 
 Databricks Asset Bundles (targets `dev` y `prod`) con despliegue por GitHub Actions.
 
