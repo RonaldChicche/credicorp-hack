@@ -178,3 +178,21 @@ Archivo adicional con novedades posteriores al corte de los datos (2026-08-14). 
 | `required_action` | Lo que debe analizarse |
 
 Nota: los cierres de `prices_intraday` difieren de los de `prices_daily` en promedio ~14% (comparando el último cierre de cada día), por lo que no son la misma serie y no se combinan.
+
+## Cómo está guardado en Databricks
+
+Esquema `workspace.credicorp_hack`: 12 tablas Delta *managed*. Se leyó de `information_schema` el 2026-10-31.
+
+- Las claves de las tablas de arriba son **lógicas**: Delta no tiene PK/FK definidas y todas las columnas aceptan nulos. La unicidad la garantiza el notebook de limpieza.
+- Las columnas de fecha (`date`, `event_date`, `period_end`) están guardadas como `TIMESTAMP` a las 00:00, no como `DATE`. Usa `CAST(date AS DATE)` al comparar.
+- Ninguna tabla ni columna tiene `comment` en Unity Catalog.
+- Tablas de análisis (escritas por los notebooks de `notebooks/analisis/`):
+
+| Tabla | Filas | Grano | Notebook |
+|---|---|---|---|
+| `analysis_asset_stats` | 8 | activo | `analisis_portafolio` |
+| `analysis_client_summary` | 3 | cliente | `analisis_portafolio` |
+| `analysis_client_weights` | 21 | cliente × activo | `analisis_portafolio` |
+| `analysis_twist_summary` | 3 | novedad del twist | `analisis_twist` |
+
+Versión navegable con buscador de columnas: https://claude.ai/artifact/UWy6UGAk6AvYfH7btANJdo (privada; solo la abre quien tenga acceso).
