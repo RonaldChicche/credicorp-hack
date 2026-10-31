@@ -120,7 +120,7 @@ el **núcleo** (70%) y el **tramo de liquidez** (30%). El notebook:
 Antes de correr comprueba que su evaluación coincide con `gold_score_detail` hasta 1e-9, para que haya una sola definición de cada indicador.
 
 **Resultado (semilla 42):** de 130.000 carteras evaluadas, **14.482 (11.1%) cumplen los tres límites**; el mejor drawdown hallado es -9.05% (el límite es -10%).
-Es decir, el límite sí es alcanzable: lo que fallaba eran las dos carteras de referencia, no el límite. Las 50 mejores tienen score total entre 73.7 y 73.8.
+Es decir, el límite sí es alcanzable: lo que fallaba eran las dos carteras de referencia, no el límite. Las 50 mejores tienen score total entre 73.5 y 73.8. El detalle, la cartera recomendada y las pruebas de robustez están en [`simulacion_y_recomendacion.md`](simulacion_y_recomendacion.md).
 
 **Cómo leerlo**
 - Las 50 candidatas son casi intercambiables en score pero con pesos muy distintos: el score no identifica una única cartera óptima, solo una región de carteras buenas.
