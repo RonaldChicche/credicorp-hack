@@ -5,7 +5,7 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "main")
+dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "default")
 dbutils.widgets.text("table", "")
 

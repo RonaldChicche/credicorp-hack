@@ -1,5 +1,5 @@
 # Databricks notebook source
-dbutils.widgets.text("catalog", "main")
+dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "default")
 
 catalog = dbutils.widgets.get("catalog")

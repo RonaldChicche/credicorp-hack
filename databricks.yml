@@ -7,7 +7,7 @@ include:
 variables:
   catalog:
     description: Unity Catalog catalog donde escribe el bundle
-    default: main
+    default: workspace
   schema:
     description: Schema destino
     default: default
