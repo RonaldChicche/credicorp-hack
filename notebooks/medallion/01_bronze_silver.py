@@ -890,6 +890,44 @@ if silver_diario is not None and silver_intradia is not None:
     )
     display(resumen.round(2))
 
+    # ¿Cuál fuente es coherente con el resto del caso? Se contrasta cada una con datos independientes:
+    # el factor de mercado y el régimen de 02_macro. Una serie real de mercado debe moverse con el
+    # factor de mercado y caer en los días de Stress.
+    mac = silver_macro.set_index("fecha")
+    coherencia = []
+    for fuente, col in [("diario", "ret_diario"), ("intradia", "ret_intradia")]:
+        r = c.pivot_table(index="fecha", columns="asset_id", values=col)
+        j = r.join(mac[["market_factor", "risk_regime"]], how="inner")
+        ew = j[r.columns].mean(axis=1)
+        por_regimen = ew.groupby(j["risk_regime"]).mean()
+        coherencia.append(
+            {
+                "fuente": fuente,
+                "corr_promedio_vs_market_factor": ew.corr(j["market_factor"]),
+                "ret_diario_medio_stress": por_regimen.get("Stress", np.nan),
+                "ret_diario_medio_recovery": por_regimen.get("Recovery", np.nan),
+                "ret_diario_medio_normal": por_regimen.get("Normal", np.nan),
+            }
+        )
+    coherencia = pd.DataFrame(coherencia)
+    guardar(coherencia, "silver_coherencia_fuentes")
+    mejor = coherencia.loc[
+        coherencia["corr_promedio_vs_market_factor"].idxmax(), "fuente"
+    ]
+    BITACORA.append(
+        {
+            "tabla": "silver_coherencia_fuentes",
+            "regla": "C2_fuente_coherente_con_macro",
+            "accion": "MARCAR",
+            "filas_afectadas": len(coherencia),
+            "porque": f"La fuente '{mejor}' es la que se mueve con market_factor y con los regímenes de 02_macro; "
+            "se recomienda como fuente principal de precios para la ventana del caso.",
+            "ejemplos": coherencia.round(4).to_json(orient="records"),
+            "run_id": RUN_ID,
+        }
+    )
+    display(coherencia.round(4))
+
 # COMMAND ----------
 
 # ===== CELDA 9: BITÁCORA DE CALIDAD (evidencia para el jurado) =====
