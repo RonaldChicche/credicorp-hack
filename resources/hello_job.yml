@@ -1,0 +1,16 @@
+resources:
+  jobs:
+    hello_job:
+      name: hello_job_${bundle.target}
+      tasks:
+        - task_key: hello
+          notebook_task:
+            notebook_path: ../src/hello.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"

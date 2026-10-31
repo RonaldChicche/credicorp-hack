@@ -1,0 +1,35 @@
+bundle:
+  name: databricks-bundles
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog donde escribe el bundle
+    default: main
+  schema:
+    description: Schema destino
+    default: default
+  service_principal_id:
+    description: Application ID del service principal que ejecuta prod
+    default: ""
+
+# El host NO va aquí: el CLI lo toma de DATABRICKS_HOST (CI) o del perfil
+# en ~/.databrickscfg (local). Para fijarlo, añade `workspace.host` por target
+# o usa `databricks bundle deploy -t dev --profile <perfil>`.
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      schema: dev
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schema: prod
+    run_as:
+      service_principal_name: ${var.service_principal_id}
