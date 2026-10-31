@@ -1684,10 +1684,232 @@ if evaluadas:
 
 # COMMAND ----------
 
+# ===== CELDA 7F: SCORE DE RECOMENDACIÓN POR ACTIVO (gold_score_activos, gold_score_pesos) =====
+# Score fijo de 0 a 100 por activo y por cliente, para el análisis del dashboard. Cada componente es el
+# ranking del activo entre los 9 del universo (8 acciones + bono), medido en la moneda del cliente:
+#   rentabilidad_riesgo: Sharpe (exceso sobre la caja en su moneda)  · control_caida: caída máxima
+#   resistencia: estrés de feb-2026 + escenarios del twist           · momentum: retorno de 3 meses
+#   fundamentales: crecimiento de utilidad, margen EBITDA, deuda neta/EBITDA · eventos: efecto propio a 5 días
+# Las ponderaciones dependen del perfil y son fijas (quedan en gold_score_pesos). Sin dato (p. ej. fundamentales
+# del bono), el componente no cuenta y se reparte su peso entre los demás.
+PONDERACIONES = {
+    "preservacion": {
+        "rentabilidad_riesgo": 0.20,
+        "control_caida": 0.25,
+        "resistencia": 0.25,
+        "momentum": 0.10,
+        "fundamentales": 0.10,
+        "eventos": 0.10,
+    },
+    "crecimiento": {
+        "rentabilidad_riesgo": 0.25,
+        "control_caida": 0.10,
+        "resistencia": 0.10,
+        "momentum": 0.25,
+        "fundamentales": 0.15,
+        "eventos": 0.15,
+    },
+    "balanceado": {
+        "rentabilidad_riesgo": 0.25,
+        "control_caida": 0.15,
+        "resistencia": 0.15,
+        "momentum": 0.15,
+        "fundamentales": 0.15,
+        "eventos": 0.15,
+    },
+}
+UMBRAL_SI = (
+    60  # score mínimo para "Sí · alternativa" cuando el activo no está en la cartera
+)
+
+
+def perfil_score(cid):
+    dd = next(
+        r["params"]["limite"]
+        for r in resultados[cid]["reglas"]
+        if r["rule_type"] == "DD_MAX"
+    )
+    if dd <= 0.10:
+        return "preservacion"
+    return (
+        "crecimiento" if resultados[cid]["objetivo"] == "max_retorno" else "balanceado"
+    )
+
+
+def rango(serie, mayor_es_mejor=True):
+    # Posición 0..1 entre los activos con dato (1 = el mejor)
+    r = serie.rank(ascending=mayor_es_mejor, method="average")
+    n = serie.notna().sum()
+    return (r - 1) / (n - 1) if n > 1 else r * 0 + 0.5
+
+
+def dato(a, c, v, con_twist):
+    # Valor real detrás de cada componente, para la razón en texto
+    if c == "rentabilidad_riesgo":
+        return f"Sharpe {v.at[a, 'sharpe']:.2f}"
+    if c == "control_caida":
+        return f"caída máxima {v.at[a, 'max_drawdown']:.1%}"
+    if c == "resistencia":
+        return f"estrés feb {v.at[a, 'estres_feb']:.1%}" + (
+            f", twist {v.at[a, 'estres_twist']:.1%}" if con_twist else ""
+        )
+    if c == "momentum":
+        return f"retorno 3 meses {v.at[a, 'retorno_3m']:.1%}"
+    if c == "fundamentales":
+        if pd.isna(v.at[a, "crec_utilidad_12m"]):
+            return "sin fundamentales (no es empresa)"
+        return f"utilidad {v.at[a, 'crec_utilidad_12m']:+.1%}, deuda neta/EBITDA {v.at[a, 'deuda_neta_ebitda']:.2f}"
+    if v.at[a, "peor_evento_5d"] != 0:
+        return f"evento con efecto propio {v.at[a, 'peor_evento_5d']:+.1%} a 5 días"
+    return "sin eventos negativos"
+
+
+eventos_df = leer("gold_impacto_eventos")
+peor_evento = eventos_df.groupby("asset_id")["efecto_propio_5d"].min()
+met_i = met.set_index("asset_id")
+scores = []
+for cid in clientes["client_id"]:
+    o = resultados_twist[cid] if HAY_TWIST else resultados[cid]
+    R_df = o["R"]
+    activos_s = [a for a in R_df.columns if not es_caja(a)]
+    caja_cli = R_df["CAJA"]
+    aplica = (
+        [e for e in escenarios if e["moneda"] in (None, o["moneda"])]
+        if HAY_TWIST
+        else []
+    )
+    v = pd.DataFrame(index=activos_s)
+    v["sharpe"] = [
+        (R_df[a] - caja_cli).mean() * 252 / (R_df[a].std() * np.sqrt(252))
+        for a in activos_s
+    ]
+    v["max_drawdown"] = [max_drawdown(R_df[a]) for a in activos_s]
+    v["retorno_12m"] = [(1 + R_df[a]).prod() - 1 for a in activos_s]
+    v["estres_feb"] = [
+        (1 + R_df[a].loc[pd.Timestamp(ESTRES[0]) : pd.Timestamp(ESTRES[1])]).prod() - 1
+        for a in activos_s
+    ]
+    v["estres_twist"] = [
+        impacto([1.0], [a], o["moneda"], aplica) if aplica else np.nan
+        for a in activos_s
+    ]
+    v["retorno_3m"] = met_i.loc[activos_s, "retorno_3m"].astype(float)
+    v["crec_utilidad_12m"] = met_i.loc[activos_s, "crec_utilidad_12m"].astype(float)
+    v["margen_ebitda"] = met_i.loc[activos_s, "margen_ebitda"].astype(float)
+    v["deuda_neta_ebitda"] = met_i.loc[activos_s, "deuda_neta_ebitda"].astype(float)
+    v["peor_evento_5d"] = peor_evento.reindex(activos_s).fillna(
+        0.0
+    )  # sin evento = 0 (neutral)
+
+    comp = pd.DataFrame(index=activos_s)
+    comp["rentabilidad_riesgo"] = rango(v["sharpe"])
+    comp["control_caida"] = rango(v["max_drawdown"])  # menos negativa = mejor
+    comp["resistencia"] = pd.concat(
+        [rango(v["estres_feb"]), rango(v["estres_twist"])], axis=1
+    ).mean(axis=1)
+    comp["momentum"] = rango(v["retorno_3m"])
+    comp["fundamentales"] = pd.concat(
+        [
+            rango(v["crec_utilidad_12m"]),
+            rango(v["margen_ebitda"]),
+            rango(v["deuda_neta_ebitda"], mayor_es_mejor=False),
+        ],
+        axis=1,
+    ).mean(axis=1)
+    comp["eventos"] = rango(v["peor_evento_5d"])
+
+    perfil = perfil_score(cid)
+    pond = pd.Series(PONDERACIONES[perfil])
+    peso_util = comp.notna().mul(pond, axis=1).sum(axis=1)
+    score = (comp.fillna(0).mul(pond, axis=1).sum(axis=1) / peso_util * 100).round(1)
+    ranking = score.rank(ascending=False, method="min").astype(int)
+    pesos_cartera = dict(zip(o["universo"], o["pesos"]))
+
+    for a in activos_s:
+        c_ok = comp.loc[a].dropna()
+        aportes = (c_ok - 0.5) * pond[
+            c_ok.index
+        ]  # cuánto empuja cada componente sobre/bajo la media
+        fuertes = [
+            c for c in aportes.sort_values(ascending=False).index[:2] if aportes[c] > 0
+        ]
+        debiles = [c for c in aportes.sort_values().index[:2] if aportes[c] < 0]
+        peso = float(pesos_cartera.get(a, 0.0))
+        if peso > 0:
+            veredicto = f"Sí · en la cartera ({peso:.0%})"
+        elif score[a] >= UMBRAL_SI:
+            veredicto = "Sí · alternativa"
+        else:
+            veredicto = "No"
+        razon = (
+            f"Score {score[a]:.0f}/100 (puesto {ranking[a]} de {len(activos_s)}, perfil {perfil}). "
+            f"A favor: {'; '.join(dato(a, c, v, bool(aplica)) for c in fuertes) or 'ningún componente sobre la media'}. "
+            f"En contra: {'; '.join(dato(a, c, v, bool(aplica)) for c in debiles) or 'ningún componente bajo la media'}."
+        )
+        # Dónde aparece el activo en las 3 opciones: explica un "Sí · alternativa" con datos
+        en_opciones = [f"{op[0]} {resultados_opciones[(cid, op[0])]['pesos'][resultados_opciones[(cid, op[0])]['universo'].index(a)]:.0%}"
+                       for op in OPCIONES
+                       if a in resultados_opciones[(cid, op[0])]["universo"]
+                       and resultados_opciones[(cid, op[0])]["pesos"][resultados_opciones[(cid, op[0])]["universo"].index(a)] > 0]
+        if peso == 0 and score[a] >= UMBRAL_SI:
+            razon += (f" No entra en la cartera principal porque su objetivo ({o['objetivo']}) prioriza otros activos"
+                      + (f"; sí aparece en: {', '.join(en_opciones)}." if en_opciones else "."))
+        elif peso == 0 and score[a] >= UMBRAL_SI - 10:
+            razon += " Cerca del umbral: candidato si cambian las condiciones."
+        elif peso > 0 and score[a] < UMBRAL_SI:
+            razon += (f" Está en la cartera por su aporte al objetivo ({o['objetivo']}); su score bajo marca el riesgo a "
+                      f"vigilar: {'; '.join(dato(a, c, v, bool(aplica)) for c in debiles) or 'ver componentes'}.")
+        scores.append(
+            {
+                "client_id": cid,
+                "asset_id": a,
+                "nombre": INFO.at[a, "name"],
+                "clase": clase(a),
+                "score": float(score[a]),
+                "ranking": int(ranking[a]),
+                "veredicto": veredicto,
+                "peso_en_cartera": peso,
+                "perfil_score": perfil,
+                **{
+                    f"comp_{c}": (
+                        round(float(comp.at[a, c]) * 100, 1)
+                        if pd.notna(comp.at[a, c])
+                        else np.nan
+                    )
+                    for c in comp.columns
+                },
+                **{
+                    k: (float(v.at[a, k]) if pd.notna(v.at[a, k]) else np.nan)
+                    for k in v.columns
+                },
+                "razon": razon,
+                "run_id": RUN_ID,
+            }
+        )
+
+df_score = pd.DataFrame(scores).sort_values(["client_id", "ranking"])
+guardar(df_score, "gold_score_activos")
+guardar(
+    pd.DataFrame(
+        [
+            {"perfil": p_, "componente": c, "ponderacion": w_}
+            for p_, d_ in PONDERACIONES.items()
+            for c, w_ in d_.items()
+        ]
+    ),
+    "gold_score_pesos",
+)
+display(
+    df_score[df_score["client_id"] == CLIENTE_ELEGIDO][
+        ["ranking", "nombre", "score", "veredicto", "razon"]
+    ]
+)
+
+# COMMAND ----------
 # ===== CELDA 8: AGENTE EXPLICADOR (brief del cliente elegido, citando tablas Gold) =====
 # Mismo ciclo que el agente investigador: Gemini pide una herramienta, el código la ejecuta.
 # Las secciones responden las 5 preguntas del Decision Dashboard.
-MAX_PASOS = 16  # 10 consultas obligatorias + margen para una entrega rechazada
+MAX_PASOS = 18  # 11 consultas obligatorias + margen para una entrega rechazada
 PCT = [
     "impacto",
     "ret_motor",
@@ -1896,6 +2118,11 @@ HERRAMIENTAS["ver_justificacion"] = lambda: a_texto(
         ["asset_id", "nombre", "clase", "peso", "aporte_retorno", "aporte_riesgo", "razon"]]
 )
 OBLIGATORIAS.add("ver_justificacion")
+# Score fijo por activo: el brief lo usa para explicar por qué sí o por qué no cada activo
+HERRAMIENTAS["ver_score"] = lambda: a_texto(
+    leer("gold_score_activos").query("client_id == @CLIENTE_ELEGIDO")[
+        ["ranking", "asset_id", "nombre", "score", "veredicto", "razon"]])
+OBLIGATORIAS.add("ver_score")
 if spark.catalog.tableExists(f"{DB}.gold_carteras_equipo") and evaluadas:
     # Carteras del equipo para este cliente: el brief las compara con la del motor
     HERRAMIENTAS["ver_carteras_equipo"] = lambda: a_texto(
@@ -1915,7 +2142,8 @@ Reglas:
   y por qué esa proporción (límite de caída, liquidez requerida, efecto de tasas en la renta fija). Luego UN punto por cada posición con peso > 0, con nombre de la empresa (o tipo de caja), sector, país,
   peso, y el porqué de ESE porcentaje tomado de ver_justificacion (razon: aporte al retorno y al riesgo, qué pasa
   con 5 puntos más o menos y qué regla lo fija), más una métrica de ver_metricas.
-- "senales": qué activos quedaron fuera y por qué (métrica o evento de ver_eventos), y qué evento explica movimientos.
+- "senales": qué activos quedaron fuera y por qué, con el score y la razon de ver_score (veredicto No), y qué
+  evento explica movimientos.
 - "significado_cliente": qué implica la recomendación para este cliente (moneda, liquidez, límite de caída).
 - En "recomendacion", después de las posiciones, agrega UN punto por cada opción de ver_opciones (Conservadora,
   Balanceada, Crecimiento) con su retorno, caída y si resiste el twist, para que el cliente elija cuánto riesgo tomar.
@@ -1950,6 +2178,7 @@ TABLA_DE = {
     "ver_opciones": {"gold_opciones_cliente"},
     "ver_justificacion": {"gold_justificacion_pesos"},
     "ver_carteras_equipo": {"gold_carteras_equipo"},
+    "ver_score": {"gold_score_activos"},
 }
 
 # Escalable: un brief por cliente (widget brief_clientes = "todos" o una lista "CL_01,CL_03").
