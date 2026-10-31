@@ -139,7 +139,14 @@ def retornos_cliente(close_panel, moneda):
             .iloc[1:]
         )
         r = (1 + r).mul(1 + fx, axis=0) - 1
+        # CAJA_LOCAL = liquidez en la moneda del cliente, sin riesgo cambiario. El caso no trae una tasa
+        # local (COP/PEN), así que rinde 0%: supuesto conservador, declarado en gold_reglas_cliente.
+        r["CAJA_LOCAL"] = 0.0
     return r
+
+
+def es_caja(a):
+    return a in ("CAJA", "CAJA_LOCAL")
 
 
 # COMMAND ----------
@@ -273,6 +280,7 @@ CATALOGO = {
     "MAX_PESO_ACTIVO": {"limite": (0.05, 1.0)},
     "MIN_CAJA": {"limite": (0.0, 1.0)},
     "MAX_CAJA": {"limite": (0.0, 1.0)},
+    "MIN_CAJA_LOCAL": {"limite": (0.0, 1.0)},
     "EXCLUIR_ACTIVO": {"asset_id": sorted(INFO.index)},
     "OBJETIVO": {"tipo": ["max_sharpe", "max_retorno", "min_volatilidad"]},
 }
@@ -287,6 +295,7 @@ DESCRIPCION = {
     "MAX_PESO_ACTIVO": "peso máximo en un solo activo",
     "MIN_CAJA": "liquidez mínima (CAJA)",
     "MAX_CAJA": "liquidez máxima (CAJA): obliga a estar invertido",
+    "MIN_CAJA_LOCAL": "liquidez mínima en la moneda del cliente, sin riesgo cambiario (CAJA_LOCAL)",
     "EXCLUIR_ACTIVO": "activo prohibido",
     "OBJETIVO": "qué se maximiza dentro de las reglas",
 }
@@ -513,9 +522,11 @@ def evaluar(W, R, universo, info_alta_vol, reglas_c):
         m["sharpe"] = np.where(
             m["vol"] > 1e-9, exceso.mean(axis=1) * 252 / m["vol"], 0.0
         )
-    acciones = [a for a in universo if a != "CAJA"]
+    acciones = [a for a in universo if not es_caja(a)]
     ia = [universo.index(a) for a in acciones]
-    caja = W[:, universo.index("CAJA")]
+    # Liquidez total = CAJA (USD) + CAJA_LOCAL. Para un cliente en USD la CAJA ya es su moneda local.
+    local = W[:, universo.index("CAJA_LOCAL" if "CAJA_LOCAL" in universo else "CAJA")]
+    caja = W[:, [universo.index(a) for a in universo if es_caja(a)]].sum(axis=1)
 
     def agrupado(col):
         grupos = sorted(INFO.loc[acciones, col].unique())
@@ -555,6 +566,8 @@ def evaluar(W, R, universo, info_alta_vol, reglas_c):
             res[r["clave"]] = (caja, p["limite"], "min")
         elif t == "MAX_CAJA":
             res[r["clave"]] = (caja, p["limite"], "max")
+        elif t == "MIN_CAJA_LOCAL":
+            res[r["clave"]] = (local, p["limite"], "min")
         elif t == "EXCLUIR_ACTIVO":
             res[r["clave"]] = (W[:, universo.index(p["asset_id"])], 0.0, "max")
     return m, res
@@ -597,14 +610,23 @@ def optimizar(
     R_df = retornos_cliente(close_panel, moneda).dropna()
     universo = list(R_df.columns)
     R = R_df.values
-    acciones = [a for a in universo if a != "CAJA"]
+    acciones = [a for a in universo if not es_caja(a)]
     vol_act = R_df[acciones].std() * np.sqrt(252)
     alta_vol = (vol_act > umbral_alta_vol).astype(float).values
 
-    # Candidatos: la CAJA se muestrea dentro de sus límites para no desperdiciar mezclas imposibles
+    # Candidatos: la liquidez total se muestrea dentro de sus límites para no desperdiciar mezclas imposibles
     rng = np.random.default_rng(SEMILLA)
+    min_local = max(
+        [
+            r["params"]["limite"]
+            for r in restricciones
+            if r["rule_type"] == "MIN_CAJA_LOCAL"
+        ],
+        default=0.0,
+    )
     lo = max(
-        [r["params"]["limite"] for r in restricciones if r["rule_type"] == "MIN_CAJA"],
+        [r["params"]["limite"] for r in restricciones if r["rule_type"] == "MIN_CAJA"]
+        + [min_local],
         default=0.0,
     )
     hi = min(
@@ -621,14 +643,21 @@ def optimizar(
     )
     ia = [universo.index(a) for a in acciones]
     jc = universo.index("CAJA")
+    jl = universo.index("CAJA_LOCAL") if "CAJA_LOCAL" in universo else None
+    frac_local = rng.uniform(0, 1, n)
 
-    def armar(caja, resto):
-        # Caja dentro de [lo, hi], acciones repartidas en el resto, activos excluidos pasan a caja
+    def armar(caja, frac_local, resto):
+        # Liquidez dentro de [lo, hi] repartida entre CAJA (USD) y CAJA_LOCAL (al menos min_local);
+        # acciones en el resto; activos excluidos pasan a CAJA
         resto = np.where(resto.sum(axis=1, keepdims=True) == 0, 1.0, resto)
         resto = resto / resto.sum(axis=1, keepdims=True)
         W = np.zeros((len(caja), len(universo)))
         W[:, ia] = resto * (1 - caja)[:, None]
-        W[:, jc] = caja
+        if jl is None:
+            W[:, jc] = caja
+        else:
+            loc = np.clip(np.maximum(frac_local * caja, min_local), 0, caja)
+            W[:, jl], W[:, jc] = loc, caja - loc
         for r in restricciones:
             if r["rule_type"] == "EXCLUIR_ACTIVO":
                 j = universo.index(r["params"]["asset_id"])
@@ -655,7 +684,7 @@ def optimizar(
             "min_volatilidad": -m["vol"],
         }[objetivo]
 
-    W = armar(caja, resto)
+    W = armar(caja, frac_local, resto)
     m, res = evaluar(W, R, universo, alta_vol, restricciones)
 
     # Refinamiento local: alrededor de las mejores mezclas (o de las que menos incumplen) se prueban
@@ -669,7 +698,9 @@ def optimizar(
         base_e = elites[rng.integers(len(elites), size=k)]
         t = rng.uniform(0.02, 0.25, k)[:, None]
         nuevo = (1 - t) * base_e + t * rng.dirichlet(np.full(len(universo), 0.5), k)
-        W = np.vstack([W, armar(np.clip(nuevo[:, jc], lo, hi), nuevo[:, ia])])
+        liq = nuevo[:, jc] + (nuevo[:, jl] if jl is not None else 0)
+        frac = nuevo[:, jl] / np.maximum(liq, 1e-12) if jl is not None else np.zeros(k)
+        W = np.vstack([W, armar(np.clip(liq, lo, hi), frac, nuevo[:, ia])])
         m, res = evaluar(W, R, universo, alta_vol, restricciones)
 
     # La decisión se toma sobre pesos YA redondeados a 5%: lo que se recomienda es exactamente lo que se evalúa
@@ -705,30 +736,39 @@ def optimizar(
 
 resultados = {cid: optimizar(cid, reglas, close) for cid in clientes["client_id"]}
 
-rec, cump, bt, nube = [], [], [], []
 papel = met.set_index("asset_id")["papel"].to_dict()
-for cid, o in resultados.items():
+
+
+def filas_recomendacion(cid, o, **extra):
+    filas = []
     for a, w in zip(o["universo"], o["pesos"]):
-        if w > 0:
-            rec.append(
-                {
-                    "client_id": cid,
-                    "asset_id": a,
-                    "peso": w,
-                    "nombre": "Caja (depósito USD)"
-                    if a == "CAJA"
-                    else INFO.at[a, "name"],
-                    "sector": "Caja" if a == "CAJA" else INFO.at[a, "sector"],
-                    "pais": "—" if a == "CAJA" else INFO.at[a, "country"],
-                    "papel": "liquidez" if a == "CAJA" else papel[a],
-                    "moneda_cliente": o["moneda"],
-                    "objetivo": o["objetivo"],
-                    "estado": o["estado"],
-                    **{f"port_{k}": v for k, v in o["metricas"].items()},
-                    "fuente_precios": FUENTE,
-                    "run_id": RUN_ID,
-                }
-            )
+        if w <= 0:
+            continue
+        nombre = {"CAJA": "Caja (depósito USD)", "CAJA_LOCAL": f"Caja en {o['moneda']}"}
+        filas.append(
+            {
+                "client_id": cid,
+                "asset_id": a,
+                "peso": w,
+                "nombre": nombre.get(a) or INFO.at[a, "name"],
+                "sector": "Caja" if es_caja(a) else INFO.at[a, "sector"],
+                "pais": "—" if es_caja(a) else INFO.at[a, "country"],
+                "papel": "liquidez" if es_caja(a) else papel[a],
+                "moneda_cliente": o["moneda"],
+                "objetivo": o["objetivo"],
+                "estado": o["estado"],
+                **{f"port_{k}": v for k, v in o["metricas"].items()},
+                "fuente_precios": FUENTE,
+                **extra,
+                "run_id": RUN_ID,
+            }
+        )
+    return filas
+
+
+rec, cump, bt, nube = [], [], [], []
+for cid, o in resultados.items():
+    rec += filas_recomendacion(cid, o)
     for r in o["reglas"]:
         v, lim, s = o["res"][r["clave"]]
         holgura = (lim - v) if s == "max" else (v - lim)
@@ -752,7 +792,8 @@ for cid, o in resultados.items():
     # Backtest: la mezcla elegida contra repartir igual en las 8 acciones, en la moneda del cliente
     R_df = o["R"]
     valor_p = (1 + R_df.values @ o["pesos"]).cumprod()
-    valor_ew = (1 + R_df.drop(columns="CAJA").mean(axis=1)).cumprod()
+    acciones = [a for a in R_df.columns if not es_caja(a)]
+    valor_ew = (1 + R_df[acciones].mean(axis=1)).cumprod()
     bt += [
         {"client_id": cid, "fecha": f, "valor_portafolio": vp, "valor_igual_peso": ve}
         for f, vp, ve in zip(R_df.index, valor_p, valor_ew)
@@ -869,11 +910,214 @@ display(df_sens.round(3))
 
 # COMMAND ----------
 
+# ===== CELDA 7B: TWIST: nueva información posterior a la fecha de corte (silver_twist) =====
+# No trae precios nuevos: cada fila se convierte en (a) reglas nuevas si afecta a un cliente o
+# (b) un escenario de estrés si es de mercado (tasas, tipo de cambio). Luego se compara antes vs. después.
+HAY_TWIST = spark.catalog.tableExists(f"{DB}.silver_twist")
+if not HAY_TWIST:
+    print("Sin silver_twist: se omite esta celda.")
+else:
+    tw = leer("silver_twist")
+    print("Twist vigente desde:", tw["fecha_efectiva"].max())
+
+    # (a) Twists de cliente -> reglas. El agente propone, el código valida; si no hay agente, regla por texto.
+    nuevas = []
+    for t in tw[tw["tipo"] == "Client"].itertuples():
+        cid = t.client_id
+        actuales = reglas[reglas["client_id"] == cid][["rule_type", "params"]].to_dict(
+            "records"
+        )
+        propuestas_tw = []
+        if AGENTE_ACTIVO:
+            prompt = f"""Llegó información nueva sobre el cliente {cid}. Decide qué reglas agregar o reemplazar.
+Usa SOLO estos tipos: {catalogo_txt}
+Reglas actuales del cliente: {json.dumps(actuales, ensure_ascii=False)}
+Moneda base del cliente: {clientes.set_index("client_id").at[cid, "base_currency"]}
+Si una regla nueva es del mismo tipo que una actual, la reemplaza.
+Marca "supuesto": true si el número o la forma de cumplirla no está escrita literalmente en la noticia.
+Responde solo una lista JSON: [{{"rule_type": "", "params": {{}}, "evidencia_texto": "", "supuesto": false}}]
+NOTICIA ({t.release_id}): {t.new_information}
+ACCIÓN REQUERIDA: {t.required_action}"""
+            try:
+                propuestas_tw = extraer_json(preguntar(prompt))
+            except Exception as e:
+                print(t.release_id, "respuesta no válida del agente:", e)
+        validas = [
+            p
+            for p in propuestas_tw
+            if validar(p.get("rule_type"), p.get("params"))[0]
+            and p.get("rule_type") not in ("MONEDA_BASE", "DD_MAX")
+        ]
+        origen = "agente"
+        if not validas and t.pct is not None and not np.isnan(t.pct):
+            # Respaldo determinista: "necesitará disponer de X% del portafolio" -> liquidez mínima X%.
+            # Que esa liquidez esté en la moneda del cliente es inferencia (la necesidad es en su moneda).
+            origen = "regla_texto"
+            validas = [
+                {
+                    "rule_type": "MIN_CAJA",
+                    "params": {"limite": t.pct / 100},
+                    "evidencia_texto": t.new_information,
+                    "supuesto": False,
+                },
+                {
+                    "rule_type": "MIN_CAJA_LOCAL",
+                    "params": {"limite": t.pct / 100},
+                    "evidencia_texto": "La necesidad de liquidez es en la moneda base del cliente",
+                    "supuesto": True,
+                },
+            ]
+        for p in validas:
+            nuevas.append(
+                {
+                    "client_id": cid,
+                    "rule_type": p["rule_type"],
+                    "params": p["params"],
+                    "origen": f"twist:{t.release_id}:{origen}",
+                    "evidencia_texto": p.get("evidencia_texto", ""),
+                    "supuesto": bool(p.get("supuesto", False)),
+                }
+            )
+
+    reglas_twist = reglas.copy()
+    for n_ in nuevas:
+        reglas_twist = reglas_twist[
+            ~(
+                (reglas_twist["client_id"] == n_["client_id"])
+                & (reglas_twist["rule_type"] == n_["rule_type"])
+            )
+        ]
+        reglas_twist = pd.concat([reglas_twist, pd.DataFrame([n_])], ignore_index=True)
+        # Si la nueva liquidez mínima supera el tope de caja vigente, el tope se sube (y queda registrado)
+        if n_["rule_type"] == "MIN_CAJA":
+            tope = (reglas_twist["client_id"] == n_["client_id"]) & (
+                reglas_twist["rule_type"] == "MAX_CAJA"
+            )
+            if (
+                tope.any()
+                and reglas_twist.loc[tope, "params"].iloc[0]["limite"]
+                < n_["params"]["limite"]
+            ):
+                reglas_twist.loc[tope, "params"] = [{"limite": n_["params"]["limite"]}]
+                reglas_twist.loc[tope, "origen"] = f"{n_['origen']}:ajuste_tope"
+    guardar(
+        pd.DataFrame(nuevas).assign(
+            params=lambda d: d["params"].map(json.dumps), run_id=RUN_ID
+        )
+        if nuevas
+        else pd.DataFrame({"client_id": [""]}),
+        "gold_reglas_twist",
+    )
+    display(pd.DataFrame(nuevas))
+
+    # (b) Twists de mercado -> escenarios de estrés
+    # Tasas: un alza de esta magnitud no tiene precedente en la ventana (no se puede estimar una beta),
+    # así que se usa como aproximación el episodio de Stress observado (feb-2026), activo por activo.
+    estres_hist = (
+        close_hist.loc[: pd.Timestamp(ESTRES[1])].iloc[-1]
+        / close_hist.loc[: pd.Timestamp(ESTRES[0]) - pd.Timedelta(days=1)].iloc[-1]
+        - 1
+    )
+    escenarios = []
+    for t in tw[tw["tipo"].isin(["Macro", "FX"])].itertuples():
+        if t.tipo == "Macro":
+            escenarios.append(
+                {
+                    "id": t.release_id,
+                    "nombre": f"{t.release_id}: {t.new_information}",
+                    "acciones": estres_hist.to_dict(),
+                    "moneda": None,
+                    "fx": 0.0,
+                }
+            )
+        else:
+            # "El COP se deprecia 8%": el riesgo hacia adelante es que se revierta (COP se aprecia 8%)
+            moneda = t.field.split("_")[-1].upper()
+            escenarios.append(
+                {
+                    "id": t.release_id,
+                    "nombre": f"{t.release_id}: reversión de '{t.new_information}'",
+                    "acciones": {},
+                    "moneda": moneda,
+                    "fx": (t.pct or 0) / 100,
+                }
+            )
+
+    def impacto(pesos, universo, moneda_cli, escs):
+        # Valor del portafolio tras aplicar uno o varios choques (1 = sin cambio)
+        valor = 0.0
+        for a, w in zip(universo, pesos):
+            v = 1.0
+            for e in escs:
+                v *= 1 + e["acciones"].get(a, 0.0)
+                if e["moneda"] == moneda_cli and a != "CAJA_LOCAL":
+                    v /= 1 + e["fx"]
+            valor += w * v
+        return valor - 1
+
+    afectados = sorted(
+        set(tw.loc[tw["tipo"] == "Client", "client_id"].dropna()) | {CLIENTE_ELEGIDO}
+    )
+    rec_tw, estres = [], []
+    for cid in clientes["client_id"]:
+        antes = resultados[cid]
+        despues = optimizar(cid, reglas_twist, close) if cid in afectados else antes
+        if cid in afectados:
+            rec_tw += filas_recomendacion(cid, antes, momento="antes")
+            rec_tw += filas_recomendacion(cid, despues, momento="despues")
+        dd_lim = next(
+            r["params"]["limite"] for r in antes["reglas"] if r["rule_type"] == "DD_MAX"
+        )
+        aplica = [e for e in escenarios if e["moneda"] in (None, antes["moneda"])]
+        combos = [[e] for e in aplica] + ([aplica] if len(aplica) > 1 else [])
+        for momento, o in [("antes", antes), ("despues", despues)]:
+            for esc in combos:
+                imp = impacto(o["pesos"], o["universo"], o["moneda"], esc)
+                estres.append(
+                    {
+                        "client_id": cid,
+                        "momento": momento,
+                        "escenario": " + ".join(e["id"] for e in esc),
+                        "descripcion": " | ".join(e["nombre"] for e in esc),
+                        "impacto": imp,
+                        "limite_caida": dd_lim,
+                        "cumple": -imp <= dd_lim + 1e-9,
+                        "estado_motor": o["estado"],
+                        "pesos": json.dumps(
+                            {
+                                a: round(w, 2)
+                                for a, w in zip(o["universo"], o["pesos"])
+                                if w > 0
+                            }
+                        ),
+                        "run_id": RUN_ID,
+                    }
+                )
+    guardar(pd.DataFrame(rec_tw), "gold_recomendacion_twist")
+    guardar(pd.DataFrame(estres), "gold_estres_twist")
+    display(
+        pd.DataFrame(estres)[
+            [
+                "client_id",
+                "momento",
+                "escenario",
+                "impacto",
+                "limite_caida",
+                "cumple",
+                "pesos",
+            ]
+        ].round(3)
+    )
+
+# COMMAND ----------
+
 # ===== CELDA 8: AGENTE EXPLICADOR (brief del cliente elegido, citando tablas Gold) =====
 # Mismo ciclo que el agente investigador: Gemini pide una herramienta, el código la ejecuta.
 # Las secciones responden las 5 preguntas del Decision Dashboard.
 MAX_PASOS = 10
 PCT = [
+    "impacto",
+    "limite_caida",
     "peso",
     "retorno_12m",
     "retorno_3m",
@@ -993,6 +1237,26 @@ OBLIGATORIAS = {
     "ver_cumplimiento",
     "ver_sensibilidad",
 }
+if HAY_TWIST:
+    # Con información nueva, el brief debe explicar qué cambió y si la recomendación resiste los escenarios
+    HERRAMIENTAS["ver_twist"] = lambda: (
+        leer("silver_twist").astype(str).to_json(orient="records", force_ascii=False)
+        + " | "
+        + a_texto(
+            leer("gold_recomendacion_twist").query("client_id == @CLIENTE_ELEGIDO")[
+                ["momento", "asset_id", "nombre", "peso", "estado"]
+            ]
+        )
+        + " | "
+        + a_texto(
+            leer("gold_estres_twist")
+            .query("client_id == @CLIENTE_ELEGIDO")[
+                ["momento", "escenario", "impacto", "limite_caida", "cumple"]
+            ]
+            
+        )
+    )
+    OBLIGATORIAS.add("ver_twist")
 
 instrucciones = f"""Eres analista de inversiones. Prepara el brief de la recomendación para el cliente {CLIENTE_ELEGIDO}.
 Fecha de decisión: {FECHA_CORTE.date()}. Fuente de precios usada: {FUENTE}.
@@ -1003,6 +1267,8 @@ Reglas:
 - No propongas pesos distintos a los de ver_recomendacion: el motor ya decidió.
 - Si estado = SIN_SOLUCION_FACTIBLE, dilo y explica qué regla no se puede cumplir.
 - "riesgos_supuestos" debe incluir la fuente de precios y cualquier regla con supuesto = true o al límite.
+- Si existe ver_twist: la recomendación final es la de momento = despues; explica qué noticia la cambió
+  y si resiste cada escenario (cumple = True/False) contra su límite de caída.
 Responde SIEMPRE solo un JSON con una de estas formas:
 {{"accion": "<herramienta>"}}
 {{"accion": "entregar", "brief": {{
@@ -1020,6 +1286,7 @@ TABLA_DE = {
     "ver_sensibilidad": "gold_sensibilidad",
     "ver_calidad_datos": "silver_bitacora_calidad",
     "ver_cliente": "silver_clientes",
+    "ver_twist": "gold_estres_twist",
 }
 
 if not AGENTE_ACTIVO:

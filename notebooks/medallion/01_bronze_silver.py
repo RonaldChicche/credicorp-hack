@@ -46,6 +46,7 @@ ARCHIVOS = {
     "04_asset_reference": "bronze_activos",
     "05_client_profiles": "bronze_clientes",
     "06_events": "bronze_eventos",
+    "dataset_twist": "bronze_twist",  # información nueva entregada durante el evento (opcional)
 }
 
 
@@ -839,6 +840,86 @@ for r in ev.itertuples():
         )
 guardar(pd.DataFrame(filas), t)
 display(pd.DataFrame(filas))
+
+# COMMAND ----------
+
+# ===== CELDA 7B: TWIST (Silver): noticias posteriores a la fecha de corte =====
+# Cada fila trae texto libre. Silver no lo interpreta: solo lo estructura para que Gold lo use
+# (a qué cliente afecta, qué magnitud trae) y valida tipos y fechas.
+if spark.catalog.tableExists(f"{DB}.bronze_twist"):
+    tw = leer("bronze_twist")
+    t = "silver_twist"
+    tw["dq_flags"] = ""
+    tw["fecha_efectiva"], _ = parsear_fechas(
+        tw["effective_date"], ["%Y-%m-%d"], ["%m/%d/%Y"]
+    )
+    tw["tipo"] = tw["type"].str.strip()
+    # field "CL_02_liquidity" -> cliente CL_02; "USD_COP" o "us_10y_yield" -> sin cliente
+    tw["client_id"] = tw["field"].str.extract(r"^(CL_\d{2})", expand=False)
+    # Magnitudes escritas en el texto: "30%", "8%" y "65 pb". Se extraen tal cual, sin inferir signo.
+    tw["pct"] = pd.to_numeric(
+        tw["new_information"]
+        .str.extract(r"(\d+(?:[.,]\d+)?)\s*%", expand=False)
+        .str.replace(",", "."),
+        errors="coerce",
+    )
+    tw["pb"] = pd.to_numeric(
+        tw["new_information"].str.extract(r"(\d+)\s*pb", expand=False), errors="coerce"
+    )
+    tipo_raro = ~tw["tipo"].isin(["Macro", "Client", "FX"])
+    registrar(
+        t,
+        "T1_tipo_desconocido",
+        "MARCAR",
+        tipo_raro,
+        "Tipo fuera de {Macro, Client, FX}.",
+        tw,
+        ["release_id", "type"],
+    )
+    marcar(tw, tipo_raro, "T1")
+    cli_raro = tw["client_id"].notna() & ~tw["client_id"].isin(
+        set(leer("bronze_clientes")["client_id"])
+    )
+    registrar(
+        t,
+        "T2_cliente_desconocido",
+        "MARCAR",
+        cli_raro,
+        "El cliente mencionado no existe en 05_client_profiles.",
+        tw,
+        ["release_id", "field"],
+    )
+    marcar(tw, cli_raro, "T2")
+    corte = silver_macro["fecha"].max()
+    posterior = tw["fecha_efectiva"] > corte
+    registrar(
+        t,
+        "T3_posterior_al_corte",
+        "MARCAR",
+        posterior,
+        f"Vigente después del último dato de mercado ({corte.date()}): no hay precios que la reflejen; "
+        "Gold la trata como regla nueva o escenario de estrés, no como dato histórico.",
+        tw,
+        ["release_id", "effective_date"],
+    )
+    marcar(tw, posterior, "T3")
+    silver_tw = tw[
+        [
+            "release_id",
+            "fecha_efectiva",
+            "tipo",
+            "field",
+            "client_id",
+            "pct",
+            "pb",
+            "new_information",
+            "required_action",
+            "dq_flags",
+            "_fila_origen",
+        ]
+    ]
+    guardar(silver_tw, t)
+    display(silver_tw)
 
 # COMMAND ----------
 
