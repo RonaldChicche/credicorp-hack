@@ -48,7 +48,9 @@ DIAS_PUBLICACION = 45  # un trimestre se conoce ~45 días después de su cierre
 N_CANDIDATOS = 30000
 PASO_PESO = 0.05  # pesos presentables: múltiplos de 5%
 SEMILLA = 42
-MODELO = "gemini-3.5-flash-lite"
+dbutils.widgets.text("modelo_gemini", "gemini-3.5-flash-lite")
+MODELO = dbutils.widgets.get("modelo_gemini").strip()
+SECRET_SCOPE, SECRET_KEY = "hackathon", "gemini_api_key"
 
 
 def guardar(df, nombre):
@@ -65,21 +67,46 @@ def leer(nombre):
     return spark.table(f"{DB}.{nombre}").toPandas()
 
 
-# Gemini: la key vive en un secret scope, nunca en el código (el repo es público)
-try:
-    from google import genai
-
-    cliente_llm = genai.Client(
-        api_key=dbutils.secrets.get("hackathon", "gemini_api_key")
-    )
-    AGENTE_ACTIVO = True
-except Exception as e:
-    cliente_llm, AGENTE_ACTIVO = None, False
-    print("Agente desactivado (se usan reglas manuales):", type(e).__name__, e)
+# Gemini: la key vive en un secret scope, nunca en el código (el repo es público).
+# Se verifica paso a paso para que, si falla, el mensaje diga exactamente qué falta.
+cliente_llm, AGENTE_ACTIVO = None, False
 
 
 def preguntar(prompt):
     return cliente_llm.models.generate_content(model=MODELO, contents=prompt).text
+
+
+try:
+    from google import genai
+except ImportError:
+    print(
+        "Agente desactivado: falta la librería. Corre la celda '%pip install google-genai' y luego Run all."
+    )
+else:
+    try:
+        api_key = dbutils.secrets.get(SECRET_SCOPE, SECRET_KEY)
+    except Exception as e:
+        api_key = None
+        print(
+            f"Agente desactivado: no existe el secret {SECRET_SCOPE}/{SECRET_KEY} ({type(e).__name__}). "
+            "Créalo con el notebook 00_configurar_gemini y luego Run all."
+        )
+    if api_key:
+        try:
+            cliente_llm = genai.Client(api_key=api_key)
+            preguntar(
+                "Responde solo: ok"
+            )  # prueba real: valida key y nombre del modelo
+            AGENTE_ACTIVO = True
+            print(
+                f"Agente ACTIVO · modelo {MODELO} · key desde el secret {SECRET_SCOPE}/{SECRET_KEY}"
+            )
+        except Exception as e:
+            cliente_llm = None
+            print(
+                f"Agente desactivado: el secret existe pero Gemini rechazó la llamada ({type(e).__name__}: {str(e)[:200]}). "
+                "Revisa que la key sea válida y el widget modelo_gemini."
+            )
 
 
 def extraer_json(texto, abre="[", cierra="]"):
@@ -1251,11 +1278,9 @@ if HAY_TWIST:
         )
         + " | "
         + a_texto(
-            leer("gold_estres_twist")
-            .query("client_id == @CLIENTE_ELEGIDO")[
+            leer("gold_estres_twist").query("client_id == @CLIENTE_ELEGIDO")[
                 ["momento", "escenario", "impacto", "limite_caida", "cumple"]
             ]
-            
         )
     )
     OBLIGATORIAS.add("ver_twist")
