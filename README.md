@@ -27,3 +27,4 @@ Databricks Asset Bundles (targets `dev` y `prod`) con despliegue por GitHub Acti
 - `notebooks/`: exploración + limpieza y análisis de portafolio
 - `docs/modelo_de_datos.md`: modelo de datos de los CSV
 - `notebooks/score/` + `config/`: score por cliente (límites duros, pesos y anclas configurables por twist)
+- `docs/marco_del_problema.md`: problema, límites del cliente, métricas y cómo se decide el score
