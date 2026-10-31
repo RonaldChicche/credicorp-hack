@@ -712,10 +712,11 @@ for i in df.index[trim]:
         registrar(
             t,
             "F3b_periodo_inferido",
-            "CORREGIR",
+            "MARCAR",
             m,
             f"'{df.at[i, 'period_end']}' chocaría con {p.date()} (valores distintos). Al emisor le falta {hueco[0].date()} "
-            f"y la fila está entre {previo.date()} y {siguiente.date()} en el archivo: se asigna {hueco[0].date()} y se marca INFERIDO.",
+            f"y la fila está entre {previo.date()} y {siguiente.date()} en el archivo: se asigna {hueco[0].date()} como INFERENCIA, "
+            "no como certeza (también podría ser una revisión de Q4-2024). Afecta solo a los fundamentales de ISS_02 (apoyo, no decisión).",
             df,
             ["issuer_id", "period_end", "revenue_usd_m"],
         )

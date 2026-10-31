@@ -465,14 +465,18 @@ for cid in clientes["client_id"]:
         and p["origen"] == "agente"
         and p["estado"] == "aprobada"
     ]
-    usar = (
-        ag
-        if any(p["rule_type"] == "OBJETIVO" for p in ag)
-        and len([p for p in ag if p["rule_type"] == "OBJETIVO"]) == 1
-        else [
-            p for p in propuestas if p["client_id"] == cid and p["origen"] == "manual"
+    manual = [
+        p for p in propuestas if p["client_id"] == cid and p["origen"] == "manual"
+    ]
+    if len([p for p in ag if p["rule_type"] == "OBJETIVO"]) == 1:
+        # Cobertura obligatoria: las reglas literales del perfil (supuesto = False) nunca se pierden;
+        # si el agente no tradujo alguna, entra la versión manual
+        cubiertas = {p["rule_type"] for p in ag}
+        usar = ag + [
+            p for p in manual if not p["supuesto"] and p["rule_type"] not in cubiertas
         ]
-    )
+    else:
+        usar = manual
     activas += [b for b in base if b["client_id"] == cid] + usar
 reglas = pd.DataFrame(activas)[
     ["client_id", "rule_type", "params", "origen", "evidencia_texto", "supuesto"]
@@ -503,8 +507,11 @@ def evaluar(W, R, universo, info_alta_vol, reglas_c):
     }
     m["ret_anual"] = (1 + m["ret_total"]) ** (252 / P.shape[1]) - 1
     with np.errstate(divide="ignore", invalid="ignore"):
+        # Exceso sobre la CAJA expresada en la moneda del cliente (tasa USD + efecto cambiario),
+        # para no comparar un retorno en COP/PEN contra una tasa en USD
+        exceso = P - R[:, universo.index("CAJA")]
         m["sharpe"] = np.where(
-            m["vol"] > 1e-9, (P.mean(axis=1) * 252 - RF_ANUAL) / m["vol"], 0.0
+            m["vol"] > 1e-9, exceso.mean(axis=1) * 252 / m["vol"], 0.0
         )
     acciones = [a for a in universo if a != "CAJA"]
     ia = [universo.index(a) for a in acciones]
@@ -563,11 +570,18 @@ def cumple_todo(res):
 
 def redondear(w, paso=PASO_PESO):
     # Pesos en múltiplos de 5% que suman 100% (método del mayor residuo)
+    # Acepta un vector o una matriz (una mezcla por fila)
+    W = np.atleast_2d(w)
     unidades = int(round(1 / paso))
-    base_u = np.floor(w * unidades)
-    faltan = int(unidades - base_u.sum())
-    base_u[np.argsort(-(w * unidades - base_u))[:faltan]] += 1
-    return base_u / unidades
+    base_u = np.floor(W * unidades + 1e-9)
+    faltan = (unidades - base_u.sum(axis=1)).astype(int)
+    orden = np.argsort(-(W * unidades - base_u), axis=1)
+    rango = np.argsort(
+        orden, axis=1
+    )  # posición de cada columna en el orden de residuos
+    base_u += rango < faltan[:, None]
+    out = base_u / unidades
+    return out[0] if np.ndim(w) == 1 else out
 
 
 def optimizar(
@@ -658,21 +672,19 @@ def optimizar(
         W = np.vstack([W, armar(np.clip(nuevo[:, jc], lo, hi), nuevo[:, ia])])
         m, res = evaluar(W, R, universo, alta_vol, restricciones)
 
-    factible = cumple_todo(res) if res else np.ones(len(W), bool)
-    puntaje = puntuar(m)
-
-    elegido, estado = None, "SIN_SOLUCION_FACTIBLE"
-    for i in np.argsort(-np.where(factible, puntaje, -np.inf))[:300]:
-        if not factible[i]:
-            break
-        w = redondear(W[i])[None, :]
-        _, rr = evaluar(w, R, universo, alta_vol, restricciones)
-        if cumple_todo(rr)[0]:
-            elegido, estado = w[0], "OK"
-            break
-    if elegido is None:
+    # La decisión se toma sobre pesos YA redondeados a 5%: lo que se recomienda es exactamente lo que se evalúa
+    Wd = np.unique(redondear(W), axis=0)
+    md, resd = evaluar(Wd, R, universo, alta_vol, restricciones)
+    factible_d = cumple_todo(resd) if resd else np.ones(len(Wd), bool)
+    if factible_d.any():
+        elegido, estado = (
+            Wd[np.argmax(np.where(factible_d, puntuar(md), -np.inf))],
+            "OK",
+        )
+    else:
         # Ninguna mezcla cumple: se reporta la que menos incumple, para mostrar qué regla es imposible
-        elegido = redondear(W[np.argmin(violacion(res))])
+        elegido, estado = Wd[np.argmin(violacion(resd))], "SIN_SOLUCION_FACTIBLE"
+    factible = cumple_todo(res) if res else np.ones(len(W), bool)
 
     mw, rw = evaluar(elegido[None, :], R, universo, alta_vol, restricciones)
     return {
