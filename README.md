@@ -24,3 +24,5 @@ Databricks Asset Bundles (targets `dev` y `prod`) con despliegue por GitHub Acti
 - `resources/`: jobs, pipelines, etc.
 - `src/`: notebooks y código
 - `.github/workflows/deploy.yml`: validate en PR, deploy a prod en `main`
+- `notebooks/`: exploración + limpieza y análisis de portafolio
+- `docs/modelo_de_datos.md`: modelo de datos de los CSV
