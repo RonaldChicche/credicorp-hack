@@ -79,16 +79,16 @@ def preguntar(prompt):
 try:
     from google import genai
 except ImportError:
-    print(
-        "Agente desactivado: falta la librería. Corre la celda '%pip install google-genai' y luego Run all."
+    MOTIVO_AGENTE = (
+        "falta la librería: corre la celda '%pip install google-genai' y luego Run all."
     )
 else:
     try:
         api_key = dbutils.secrets.get(SECRET_SCOPE, SECRET_KEY)
     except Exception as e:
         api_key = None
-        print(
-            f"Agente desactivado: no existe el secret {SECRET_SCOPE}/{SECRET_KEY} ({type(e).__name__}). "
+        MOTIVO_AGENTE = (
+            f"no se pudo leer el secret {SECRET_SCOPE}/{SECRET_KEY} ({type(e).__name__}: {str(e)[:200]}). "
             "Créalo con el notebook 00_configurar_gemini y luego Run all."
         )
     if api_key:
@@ -98,15 +98,16 @@ else:
                 "Responde solo: ok"
             )  # prueba real: valida key y nombre del modelo
             AGENTE_ACTIVO = True
-            print(
-                f"Agente ACTIVO · modelo {MODELO} · key desde el secret {SECRET_SCOPE}/{SECRET_KEY}"
+            MOTIVO_AGENTE = (
+                f"modelo {MODELO}, key desde el secret {SECRET_SCOPE}/{SECRET_KEY}"
             )
         except Exception as e:
             cliente_llm = None
-            print(
-                f"Agente desactivado: el secret existe pero Gemini rechazó la llamada ({type(e).__name__}: {str(e)[:200]}). "
+            MOTIVO_AGENTE = (
+                f"el secret existe pero Gemini rechazó la llamada ({type(e).__name__}: {str(e)[:300]}). "
                 "Revisa que la key sea válida y el widget modelo_gemini."
             )
+print(("Agente ACTIVO: " if AGENTE_ACTIVO else "Agente desactivado: ") + MOTIVO_AGENTE)
 
 
 def extraer_json(texto, abre="[", cierra="]"):
@@ -1317,9 +1318,7 @@ TABLA_DE = {
 }
 
 if not AGENTE_ACTIVO:
-    print(
-        "Agente desactivado: configura el secret hackathon/gemini_api_key para generar el brief."
-    )
+    print("Agente desactivado, no se genera el brief. Motivo:", MOTIVO_AGENTE)
 else:
     historial, traza, brief = "", [], None
     for paso in range(1, MAX_PASOS + 1):
