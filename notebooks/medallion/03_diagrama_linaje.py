@@ -142,6 +142,7 @@ MERMAID = f"""flowchart LR
     {n("gold_recomendacion_twist")}
     {n("gold_estres_twist")}
     {n("gold_opciones_cliente")}
+    {n("gold_opciones_pesos")}
     agx(["Agente explicador · Gemini"])
     {n("gold_brief_cliente")}
   end
@@ -181,6 +182,9 @@ MERMAID = f"""flowchart LR
   motor --> gold_estres_twist
   motor -- "3 objetivos" --> gold_opciones_cliente
   gold_opciones_cliente --> agx
+  silver_twist -- "escenarios tasas / FX" --> gold_estres_twist
+  gold_reglas_twist --> gold_opciones_cliente
+  gold_opciones_cliente --> gold_opciones_pesos
   gold_opciones_cliente --> dash
   gold_recomendacion --> agx
   gold_cumplimiento --> agx
@@ -205,7 +209,7 @@ MERMAID = f"""flowchart LR
   class c1,c1x,c2,c3,c4,c5,c6,c7 csv
   class {",".join(t for t in TABLAS if t.startswith("bronze_") and t != "bronze_perfil_archivos")} bronze
   class {",".join(t for t in TABLAS if t.startswith("silver_") and t != "silver_conciliacion_fuentes")} silver
-  class {",".join(t for t in TABLAS if t.startswith("gold_") and t not in ("gold_frontera", "gold_traza_agente", "gold_opciones_pesos"))} gold
+  class {",".join(t for t in TABLAS if t.startswith("gold_") and t not in ("gold_frontera", "gold_traza_agente"))} gold
   class agt,agx agente
   class motor motorc
   class dash dashc

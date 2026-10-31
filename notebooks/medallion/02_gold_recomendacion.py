@@ -509,6 +509,14 @@ for cid in clientes["client_id"]:
         and p["origen"] == "agente"
         and p["estado"] == "aprobada"
     ]
+    # Una regla activa por tipo (EXCLUIR_ACTIVO, una por activo): si el agente repite un tipo, gana la primera
+    vistas, unicas = set(), []
+    for p in ag:
+        clave = (p["rule_type"], p["params"].get("asset_id") if p["rule_type"] == "EXCLUIR_ACTIVO" else None)
+        if clave not in vistas:
+            vistas.add(clave)
+            unicas.append(p)
+    ag = unicas
     manual = [
         p for p in propuestas if p["client_id"] == cid and p["origen"] == "manual"
     ]
@@ -1141,6 +1149,11 @@ ACCIÓN REQUERIDA: {t.required_action}"""
                     }
                 )
     guardar(pd.DataFrame(rec_tw), "gold_recomendacion_twist")
+    if not estres:
+        # El twist no trae noticias de tasas ni de tipo de cambio: se deja constancia en vez de una tabla vacía
+        estres = [{"client_id": cid, "momento": "despues", "escenario": "sin escenarios de mercado", "descripcion": "",
+                   "impacto": 0.0, "limite_caida": 0.0, "cumple": True, "estado_motor": "", "pesos": "", "run_id": RUN_ID}
+                  for cid in clientes["client_id"]]
     guardar(pd.DataFrame(estres), "gold_estres_twist")
     display(
         pd.DataFrame(estres)[
@@ -1265,7 +1278,7 @@ display(df_op[df_op["client_id"] == CLIENTE_ELEGIDO].drop(columns=["run_id"]).ro
 # ===== CELDA 8: AGENTE EXPLICADOR (brief del cliente elegido, citando tablas Gold) =====
 # Mismo ciclo que el agente investigador: Gemini pide una herramienta, el código la ejecuta.
 # Las secciones responden las 5 preguntas del Decision Dashboard.
-MAX_PASOS = 10
+MAX_PASOS = 14  # 8 consultas obligatorias + margen para una entrega rechazada
 PCT = [
     "impacto",
     "liquidez",
@@ -1411,6 +1424,12 @@ if HAY_TWIST:
         )
     )
     OBLIGATORIAS.add("ver_twist")
+    # La recomendación vigente es la posterior al twist: ver_recomendacion la devuelve a ella
+    HERRAMIENTAS["ver_recomendacion"] = lambda: a_texto(
+        leer("gold_recomendacion_twist").query("client_id == @CLIENTE_ELEGIDO and momento == 'despues'")[
+            ["asset_id", "nombre", "sector", "pais", "papel", "peso", "estado", "objetivo", "moneda_cliente",
+             "port_ret_total", "port_drawdown", "port_vol"]]
+    )
 
 # Menú de opciones: el brief las presenta para que el cliente elija cuánto riesgo adicional tomar
 HERRAMIENTAS["ver_opciones"] = lambda: a_texto(
@@ -1449,15 +1468,15 @@ Responde SIEMPRE solo un JSON con una de estas formas:
   "riesgos_supuestos": [{{"texto": "", "tabla": ""}}]}}}}"""
 
 TABLA_DE = {
-    "ver_recomendacion": "gold_recomendacion",
-    "ver_cumplimiento": "gold_cumplimiento",
-    "ver_metricas": "gold_metricas_activo",
-    "ver_eventos": "gold_impacto_eventos",
-    "ver_sensibilidad": "gold_sensibilidad",
-    "ver_calidad_datos": "silver_bitacora_calidad",
-    "ver_cliente": "silver_clientes",
-    "ver_twist": "gold_estres_twist",
-    "ver_opciones": "gold_opciones_cliente",
+    "ver_recomendacion": {"gold_recomendacion_twist" if HAY_TWIST else "gold_recomendacion"},
+    "ver_cumplimiento": {"gold_cumplimiento"},
+    "ver_metricas": {"gold_metricas_activo"},
+    "ver_eventos": {"gold_impacto_eventos"},
+    "ver_sensibilidad": {"gold_sensibilidad"},
+    "ver_calidad_datos": {"silver_bitacora_calidad", "silver_conciliacion_fuentes"},
+    "ver_cliente": {"silver_clientes"},
+    "ver_twist": {"silver_twist", "gold_recomendacion_twist", "gold_estres_twist"},
+    "ver_opciones": {"gold_opciones_cliente"},
 }
 
 if not AGENTE_ACTIVO:
@@ -1535,7 +1554,7 @@ else:
         print(f"Paso {paso}: {accion}")
 
     # Validación por código: la tabla citada debe haberse consultado y cada cifra debe aparecer en lo consultado
-    consultadas = {TABLA_DE[t["accion"]] for t in traza if t["accion"] in TABLA_DE}
+    consultadas = set().union(*[TABLA_DE[t["accion"]] for t in traza if t["accion"] in TABLA_DE])
     cifras_fuente = set(re.findall(r"-?\d+(?:\.\d+)?", historial))
     filas = []
     for seccion, items in (brief or {}).items():
@@ -1549,10 +1568,7 @@ else:
                     "texto": it.get("texto", ""),
                     "tabla": it.get("tabla", ""),
                     # Se acepta el nombre de la tabla o el de la herramienta que la consulta
-                    "tabla_consultada": TABLA_DE.get(
-                        it.get("tabla", ""), it.get("tabla", "")
-                    )
-                    in consultadas,
+                    "tabla_consultada": bool(TABLA_DE.get(it.get("tabla", ""), {it.get("tabla", "")}) & consultadas),
                     "cifras_sin_respaldo": ",".join(sin_respaldo),
                     "run_id": RUN_ID,
                 }
