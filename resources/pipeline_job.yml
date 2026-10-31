@@ -46,6 +46,15 @@ resources:
               catalog: ${var.catalog}
               schema: credicorp_hack
           environment_key: default
+        - task_key: simulacion
+          depends_on:
+            - task_key: score
+          notebook_task:
+            notebook_path: ../notebooks/score/02_simular_portafolios.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
       environments:
         - environment_key: default
           spec:

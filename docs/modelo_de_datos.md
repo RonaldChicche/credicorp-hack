@@ -181,7 +181,7 @@ Nota: los cierres de `prices_intraday` difieren de los de `prices_daily` en prom
 
 ## Cómo está guardado en Databricks
 
-Esquema `workspace.credicorp_hack`: 19 tablas Delta *managed*. Se leyó de `information_schema` el 2026-10-31.
+Esquema `workspace.credicorp_hack`: 22 tablas Delta *managed*. Se leyó de `information_schema` el 2026-10-31.
 
 - Las claves de las tablas de arriba son **lógicas**: Delta no tiene PK/FK definidas y todas las columnas aceptan nulos. La unicidad la garantiza el notebook de limpieza.
 - Las columnas de fecha (`date`, `event_date`, `period_end`) están guardadas como `TIMESTAMP` a las 00:00, no como `DATE`. Usa `CAST(date AS DATE)` al comparar.
@@ -215,3 +215,13 @@ Versión navegable con buscador de columnas: https://claude.ai/artifact/UWy6UGAk
 
 Un twist nuevo se aplica agregando filas a los CSV de `config/` con otro `twist_id` y `vigente_desde`: por cada clave gana la fila más reciente y las anteriores quedan como historial.
 Hoy solo CL_02 tiene configuración.
+
+## Simulación de portafolios
+
+`notebooks/score/02_simular_portafolios.py` busca carteras para un cliente con los mismos límites y el mismo score de `config_*`. Escribe:
+
+| Tabla | Filas | Grano | Para qué |
+|---|---|---|---|
+| `gold_sim_candidates` | 50 | candidata | Las mejores carteras encontradas: si es apta, límites incumplidos, indicadores, score por grupo y total |
+| `gold_sim_weights` | 336 | candidata × activo | Pesos total, del núcleo y del tramo de liquidez de cada candidata |
+| `gold_sim_summary` | 1 | cliente | Cuántas carteras se simularon, cuántas fueron aptas y el mejor drawdown hallado |
