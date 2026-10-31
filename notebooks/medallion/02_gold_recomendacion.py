@@ -50,6 +50,10 @@ PASO_PESO = 0.05  # pesos presentables: múltiplos de 5%
 SEMILLA = 42
 dbutils.widgets.text("modelo_gemini", "gemini-3.5-flash-lite")
 MODELO = dbutils.widgets.get("modelo_gemini").strip()
+dbutils.widgets.text(
+    "objetivo_desde_agente", "no"
+)  # "si": el agente también elige qué se maximiza
+OBJETIVO_AGENTE = dbutils.widgets.get("objetivo_desde_agente").strip().lower() == "si"
 SECRET_SCOPE, SECRET_KEY = "hackathon", "gemini_api_key"
 
 
@@ -443,7 +447,10 @@ Usa SOLO estos tipos y parámetros (rango = [mín, máx]; lista = valores permit
 
 Reglas:
 - No generes MONEDA_BASE ni DD_MAX: ya salen de columnas numéricas.
-- Exactamente un OBJETIVO.
+- Exactamente un OBJETIVO. Criterio: "crecimiento" -> max_retorno; "preservación + crecimiento moderado" -> max_retorno
+  (la preservación ya la garantiza DD_MAX); "diversificación" -> max_sharpe. Usa min_volatilidad solo si el perfil
+  pide literalmente minimizar el riesgo: con caja disponible, min_volatilidad deja todo en caja y no es una recomendación.
+- Propón siempre un MAX_CAJA (supuesto: true) acorde al perfil: el cliente busca invertir, no quedarse en efectivo.
 - Traduce lo literal de "constraint" (ej. "Máx. 45% en un solo sector" -> MAX_POR_SECTOR limite 0.45).
 - Para "liquidity_need", "priority" y "risk_tolerance" puedes proponer reglas de CAJA u OBJETIVO;
   si el número no está escrito en el perfil, marca "supuesto": true.
@@ -506,12 +513,15 @@ for cid in clientes["client_id"]:
         p for p in propuestas if p["client_id"] == cid and p["origen"] == "manual"
     ]
     if len([p for p in ag if p["rule_type"] == "OBJETIVO"]) == 1:
-        # Cobertura obligatoria: las reglas literales del perfil (supuesto = False) nunca se pierden;
-        # si el agente no tradujo alguna, entra la versión manual
+        # Cobertura obligatoria: si el agente no cubrió un tipo de regla que sí tiene la versión manual,
+        # entra la manual. Así nunca se pierden reglas literales ni las barandas de negocio
+        # (sin MAX_CAJA, un objetivo de baja volatilidad terminaría 100% en caja)
+        # El OBJETIVO es una decisión de negocio: por defecto manda el del equipo y el del agente
+        # queda solo como propuesta en gold_reglas_propuestas (widget objetivo_desde_agente = si para usarlo)
+        if not OBJETIVO_AGENTE:
+            ag = [p for p in ag if p["rule_type"] != "OBJETIVO"]
         cubiertas = {p["rule_type"] for p in ag}
-        usar = ag + [
-            p for p in manual if not p["supuesto"] and p["rule_type"] not in cubiertas
-        ]
+        usar = ag + [p for p in manual if p["rule_type"] not in cubiertas]
     else:
         usar = manual
     activas += [b for b in base if b["client_id"] == cid] + usar
@@ -765,6 +775,13 @@ def optimizar(
 
 
 resultados = {cid: optimizar(cid, reglas, close) for cid in clientes["client_id"]}
+for cid, o in resultados.items():
+    liquidez = sum(w for a, w in zip(o["universo"], o["pesos"]) if es_caja(a))
+    if liquidez >= 0.9:
+        # Señal de reglas mal traducidas (p. ej. sin MAX_CAJA y objetivo min_volatilidad): no es una recomendación útil
+        print(
+            f"ALERTA {cid}: {liquidez:.0%} en caja. Revisa gold_reglas_cliente (OBJETIVO y MAX_CAJA)."
+        )
 
 papel = met.set_index("asset_id")["papel"].to_dict()
 
@@ -1141,12 +1158,119 @@ ACCIÓN REQUERIDA: {t.required_action}"""
 
 # COMMAND ----------
 
+# ===== CELDA 7C: MENÚ DE OPCIONES PARA EL CLIENTE (gold_opciones_cliente) =====
+# Un asesor no presenta una sola cartera: presenta alternativas que cumplen TODAS las reglas del cliente
+# (caída máxima, liquidez, twist) y explica qué gana y qué arriesga en cada una. El cliente elige cuánto
+# riesgo adicional quiere tomar dentro de su límite.
+OPCIONES = [
+    (
+        "Conservadora",
+        "min_volatilidad",
+        None,
+        "La menor volatilidad posible dentro de las reglas",
+    ),
+    (
+        "Balanceada",
+        "max_sharpe",
+        0.35,
+        "El mejor retorno por unidad de riesgo, sin más de 35% en una empresa",
+    ),
+    (
+        "Crecimiento",
+        "max_retorno",
+        None,
+        "El mayor retorno que todavía respeta el límite de caída",
+    ),
+]
+reglas_base = reglas_twist if HAY_TWIST else reglas
+opciones, opciones_pesos = [], []
+for cid in clientes["client_id"]:
+    for nombre_op, objetivo_op, tope_activo, idea in OPCIONES:
+        rr = reglas_base[
+            ~(
+                (reglas_base["client_id"] == cid)
+                & (reglas_base["rule_type"] == "OBJETIVO")
+            )
+        ]
+        extra = [
+            {
+                "client_id": cid,
+                "rule_type": "OBJETIVO",
+                "params": {"tipo": objetivo_op},
+                "origen": f"opcion:{nombre_op}",
+                "evidencia_texto": idea,
+                "supuesto": False,
+            }
+        ]
+        if tope_activo:
+            rr = rr[
+                ~((rr["client_id"] == cid) & (rr["rule_type"] == "MAX_PESO_ACTIVO"))
+            ]
+            extra.append(
+                {
+                    "client_id": cid,
+                    "rule_type": "MAX_PESO_ACTIVO",
+                    "params": {"limite": tope_activo},
+                    "origen": f"opcion:{nombre_op}",
+                    "evidencia_texto": "Diversificación",
+                    "supuesto": True,
+                }
+            )
+        o = optimizar(
+            cid, pd.concat([rr, pd.DataFrame(extra)], ignore_index=True), close
+        )
+        pesos = {a: w for a, w in zip(o["universo"], o["pesos"]) if w > 0}
+        fila = {
+            "client_id": cid,
+            "opcion": nombre_op,
+            "objetivo": objetivo_op,
+            "idea": idea,
+            "estado": o["estado"],
+            "n_empresas": sum(1 for a in pesos if not es_caja(a)),
+            "liquidez": sum(w for a, w in pesos.items() if es_caja(a)),
+            "ret_total": o["metricas"]["ret_total"],
+            "drawdown": o["metricas"]["drawdown"],
+            "vol": o["metricas"]["vol"],
+            "pesos": json.dumps({a: round(w, 2) for a, w in pesos.items()}),
+            "run_id": RUN_ID,
+        }
+        if HAY_TWIST:
+            # Resistencia a las noticias del twist que aplican a la moneda del cliente, todas juntas
+            aplica = [e for e in escenarios if e["moneda"] in (None, o["moneda"])]
+            fila["estres_twist"] = (
+                impacto(o["pesos"], o["universo"], o["moneda"], aplica)
+                if aplica
+                else 0.0
+            )
+            fila["resiste_twist"] = (
+                -fila["estres_twist"]
+                <= next(
+                    r["params"]["limite"]
+                    for r in o["reglas"]
+                    if r["rule_type"] == "DD_MAX"
+                )
+                + 1e-9
+            )
+        opciones.append(fila)
+        opciones_pesos += [
+            {**f, "opcion": nombre_op} for f in filas_recomendacion(cid, o)
+        ]
+df_op = pd.DataFrame(opciones)
+guardar(df_op, "gold_opciones_cliente")
+guardar(pd.DataFrame(opciones_pesos), "gold_opciones_pesos")
+display(df_op[df_op["client_id"] == CLIENTE_ELEGIDO].drop(columns=["run_id"]).round(3))
+
+# COMMAND ----------
+
 # ===== CELDA 8: AGENTE EXPLICADOR (brief del cliente elegido, citando tablas Gold) =====
 # Mismo ciclo que el agente investigador: Gemini pide una herramienta, el código la ejecuta.
 # Las secciones responden las 5 preguntas del Decision Dashboard.
 MAX_PASOS = 10
 PCT = [
     "impacto",
+    "liquidez",
+    "estres_twist",
+    "vol",
     "limite_caida",
     "peso",
     "retorno_12m",
@@ -1266,6 +1390,8 @@ OBLIGATORIAS = {
     "ver_recomendacion",
     "ver_cumplimiento",
     "ver_sensibilidad",
+    "ver_metricas",
+    "ver_eventos",
 }
 if HAY_TWIST:
     # Con información nueva, el brief debe explicar qué cambió y si la recomendación resiste los escenarios
@@ -1286,6 +1412,15 @@ if HAY_TWIST:
     )
     OBLIGATORIAS.add("ver_twist")
 
+# Menú de opciones: el brief las presenta para que el cliente elija cuánto riesgo adicional tomar
+HERRAMIENTAS["ver_opciones"] = lambda: a_texto(
+    leer("gold_opciones_cliente").query("client_id == @CLIENTE_ELEGIDO")[
+        [c for c in ["opcion", "idea", "estado", "n_empresas", "liquidez", "ret_total", "drawdown", "estres_twist", "resiste_twist", "pesos"]
+         if c in leer("gold_opciones_cliente").columns]
+    ]
+)
+OBLIGATORIAS.add("ver_opciones")
+
 instrucciones = f"""Eres analista de inversiones. Prepara el brief de la recomendación para el cliente {CLIENTE_ELEGIDO}.
 Fecha de decisión: {FECHA_CORTE.date()}. Fuente de precios usada: {FUENTE}.
 Herramientas (una por paso, sin argumentos): {sorted(HERRAMIENTAS)}.
@@ -1293,6 +1428,13 @@ Antes de entregar es OBLIGATORIO usar: {sorted(OBLIGATORIAS)}.
 Reglas:
 - Toda cifra debe copiarse tal cual de una herramienta y citar la tabla de donde sale.
 - No propongas pesos distintos a los de ver_recomendacion: el motor ya decidió.
+- "recomendacion": UN punto por cada posición con peso > 0, con nombre de la empresa (o tipo de caja), sector, país,
+  peso, y el porqué con al menos una métrica de ver_metricas (retorno_12m, max_drawdown, vol_anual o retorno_estres).
+- "senales": qué activos quedaron fuera y por qué (métrica o evento de ver_eventos), y qué evento explica movimientos.
+- "significado_cliente": qué implica la recomendación para este cliente (moneda, liquidez, límite de caída).
+- En "recomendacion", después de las posiciones, agrega UN punto por cada opción de ver_opciones (Conservadora,
+  Balanceada, Crecimiento) con su retorno, caída y si resiste el twist, para que el cliente elija cuánto riesgo tomar.
+- En "tabla" escribe el nombre de la herramienta que usaste (ej. ver_metricas).
 - Si estado = SIN_SOLUCION_FACTIBLE, dilo y explica qué regla no se puede cumplir.
 - "riesgos_supuestos" debe incluir la fuente de precios y cualquier regla con supuesto = true o al límite.
 - Si existe ver_twist: la recomendación final es la de momento = despues; explica qué noticia la cambió
@@ -1315,6 +1457,7 @@ TABLA_DE = {
     "ver_calidad_datos": "silver_bitacora_calidad",
     "ver_cliente": "silver_clientes",
     "ver_twist": "gold_estres_twist",
+    "ver_opciones": "gold_opciones_cliente",
 }
 
 if not AGENTE_ACTIVO:
@@ -1336,6 +1479,36 @@ else:
         accion = d.get("accion")
         if accion == "entregar":
             usadas = {t["accion"] for t in traza}
+            # Validación por código: la sección recomendacion debe nombrar cada posición del motor
+            rec_final = (
+                leer("gold_recomendacion_twist").query(
+                    "client_id == @CLIENTE_ELEGIDO and momento == 'despues'"
+                )
+                if HAY_TWIST
+                else leer("gold_recomendacion").query("client_id == @CLIENTE_ELEGIDO")
+            )
+            texto_rec = " ".join(
+                i.get("texto", "")
+                for i in (d.get("brief") or {}).get("recomendacion", [])
+            )
+            sin_mencion = [
+                r.nombre
+                for r in rec_final.itertuples()
+                if r.asset_id not in texto_rec and r.nombre not in texto_rec
+            ]
+            if OBLIGATORIAS <= usadas and sin_mencion:
+                historial += (
+                    f"\nPaso {paso}: entrega rechazada, en 'recomendacion' falta un punto para: {sin_mencion} "
+                    "(nombre, peso y porqué con una métrica)."
+                )
+                traza.append(
+                    {
+                        "paso": paso,
+                        "accion": "entregar",
+                        "resultado": f"rechazado: no menciona {sin_mencion}",
+                    }
+                )
+                continue
             if not OBLIGATORIAS <= usadas:
                 falta = sorted(OBLIGATORIAS - usadas)
                 historial += f"\nPaso {paso}: entrega rechazada, primero usa {falta}."
@@ -1375,7 +1548,11 @@ else:
                     "seccion": seccion,
                     "texto": it.get("texto", ""),
                     "tabla": it.get("tabla", ""),
-                    "tabla_consultada": it.get("tabla", "") in consultadas,
+                    # Se acepta el nombre de la tabla o el de la herramienta que la consulta
+                    "tabla_consultada": TABLA_DE.get(
+                        it.get("tabla", ""), it.get("tabla", "")
+                    )
+                    in consultadas,
                     "cifras_sin_respaldo": ",".join(sin_respaldo),
                     "run_id": RUN_ID,
                 }
