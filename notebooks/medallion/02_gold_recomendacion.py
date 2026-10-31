@@ -43,6 +43,7 @@ RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 VENTANA = 252  # 1 año bursátil hasta la fecha de corte
 UMBRAL_ALTA_VOL = 0.30  # supuesto: "alta volatilidad" = vol anual > 30%
+BONO = "BONO_UST10"  # renta fija: bono del Tesoro de EE. UU. a 10 años, construido desde us_10y_yield
 ESTRES = ("2026-02-09", "2026-02-20")  # único periodo risk_regime = Stress
 DIAS_PUBLICACION = 45  # un trimestre se conoce ~45 días después de su cierre
 N_CANDIDATOS = 30000
@@ -123,9 +124,36 @@ def extraer_json(texto, abre="[", cierra="]"):
 # ===== CELDA 1: PANEL DE PRECIOS, MACRO Y MONEDAS =====
 activos = leer("silver_activos")
 INFO = activos.set_index("asset_id")
+INFO.loc[BONO, ["name", "sector", "country", "currency"]] = [
+    "Bono del Tesoro EE. UU. 10 años",
+    "Renta fija",
+    "United States",
+    "USD",
+]
 macro = leer("silver_macro")
 macro["fecha"] = pd.to_datetime(macro["fecha"]).dt.normalize()
 macro = macro.set_index("fecha").sort_index()
+
+
+def retorno_bono(indice):
+    # Retorno diario de un bono a 10 años a partir de su tasa (no hay precios de bonos en el caso):
+    # cupón diario (tasa del día anterior / 252) menos duración × cambio de tasa.
+    # Si la tasa sube, el precio del bono cae; si baja, sube.
+    y = (macro["us_10y_yield"] / 100).reindex(indice, method="ffill")  # usa el último dato macro conocido
+    return (y.shift(1) / 252 - DURACION_BONO * y.diff()).iloc[1:].fillna(0.0)
+
+
+def duracion_modificada(tasa, anios=10, pagos=2):
+    # Duración de un bono a la par con cupón semestral, calculada con la tasa del propio CSV (no es un supuesto):
+    # cuánto cae su precio (%) por cada 1 punto que sube la tasa.
+    i, n = tasa / pagos, anios * pagos
+    macaulay = (1 + i) / i * (1 - (1 + i) ** -n) / pagos
+    return macaulay / (1 + i)
+
+
+# Con la tasa a la fecha de corte (02_macro_raw.csv)
+DURACION_BONO = duracion_modificada(macro["us_10y_yield"].dropna().iloc[-1] / 100)
+print(f"Duración del bono a 10 años: {DURACION_BONO:.2f} (tasa {macro['us_10y_yield'].dropna().iloc[-1]:.2f}%)")
 
 
 def panel_precios(fuente):
@@ -162,6 +190,7 @@ def retornos_cliente(close_panel, moneda):
     # Un inversionista en COP que tiene un activo en USD gana (o pierde) también por el tipo de cambio.
     r = close_panel.pct_change().iloc[1:].copy()
     r["CAJA"] = (macro["us_10y_yield"] / 100 / 252).reindex(r.index).ffill().values
+    r[BONO] = retorno_bono(close_panel.index).reindex(r.index).fillna(0.0)
     if moneda != "USD":
         fx = (
             macro[FX_COL[moneda]]
@@ -179,6 +208,11 @@ def retornos_cliente(close_panel, moneda):
 
 def es_caja(a):
     return a in ("CAJA", "CAJA_LOCAL")
+
+
+def clase(a):
+    # Clase de activo, como la presenta un asesor
+    return "Liquidez" if es_caja(a) else "Renta fija" if a == BONO else "Renta variable"
 
 
 # COMMAND ----------
@@ -216,6 +250,25 @@ for a in ret.columns:
             "historia_desde": close_hist[a].first_valid_index(),
         }
     )
+# Renta fija: mismas métricas para el bono, calculadas con su retorno diario desde la tasa
+rb = retorno_bono(close.index)
+rb_hist = retorno_bono(close_hist.index)
+valor_b = (1 + rb_hist).cumprod()
+filas.append(
+    {
+        "asset_id": BONO,
+        "retorno_12m": float((1 + rb).prod() - 1),
+        "retorno_3m": float((1 + rb.iloc[-63:]).prod() - 1),
+        "vol_anual": rb.std() * np.sqrt(252),
+        "max_drawdown": max_drawdown(rb),
+        "sharpe": (rb.mean() * 252 - RF_ANUAL) / (rb.std() * np.sqrt(252)),
+        "beta_mercado": rb.cov(mf) / mf.var(),
+        "retorno_estres": float((1 + rb.loc[ini_e:fin_e]).prod() - 1),
+        "vol_historica": rb_hist.std() * np.sqrt(252),
+        "max_drawdown_historico": max_drawdown(rb_hist),
+        "historia_desde": rb_hist.index.min(),
+    }
+)
 met = pd.DataFrame(filas)
 met["es_alta_vol"] = met["vol_anual"] > UMBRAL_ALTA_VOL
 vol_med = met["vol_anual"].median()
@@ -258,8 +311,11 @@ def ttm(g):
 
 fund_ttm = fund.groupby("issuer_id").apply(ttm).reset_index()
 met = met.merge(
-    activos[["asset_id", "issuer_id", "name", "sector", "country"]], on="asset_id"
+    INFO.reset_index()[["asset_id", "issuer_id", "name", "sector", "country"]],
+    on="asset_id",
+    how="left",
 ).merge(fund_ttm, on="issuer_id", how="left")
+met["clase"] = met["asset_id"].map(clase)
 met["fuente_precios"], met["fecha_corte"], met["run_id"] = FUENTE, FECHA_CORTE, RUN_ID
 guardar(met, "gold_metricas_activo")
 display(met.round(3))
@@ -512,7 +568,10 @@ for cid in clientes["client_id"]:
     # Una regla activa por tipo (EXCLUIR_ACTIVO, una por activo): si el agente repite un tipo, gana la primera
     vistas, unicas = set(), []
     for p in ag:
-        clave = (p["rule_type"], p["params"].get("asset_id") if p["rule_type"] == "EXCLUIR_ACTIVO" else None)
+        clave = (
+            p["rule_type"],
+            p["params"].get("asset_id") if p["rule_type"] == "EXCLUIR_ACTIVO" else None,
+        )
         if clave not in vistas:
             vistas.add(clave)
             unicas.append(p)
@@ -809,6 +868,7 @@ def filas_recomendacion(cid, o, **extra):
                 "sector": "Caja" if es_caja(a) else INFO.at[a, "sector"],
                 "pais": "—" if es_caja(a) else INFO.at[a, "country"],
                 "papel": "liquidez" if es_caja(a) else papel[a],
+                "clase": clase(a),
                 "moneda_cliente": o["moneda"],
                 "objetivo": o["objetivo"],
                 "estado": o["estado"],
@@ -1080,7 +1140,11 @@ ACCIÓN REQUERIDA: {t.required_action}"""
                 {
                     "id": t.release_id,
                     "nombre": f"{t.release_id}: {t.new_information}",
-                    "acciones": estres_hist.to_dict(),
+                    # Acciones: réplica del estrés de feb-2026. Bono: pérdida por duración ante el alza de tasa.
+                    "acciones": {
+                        **estres_hist.to_dict(),
+                        BONO: -DURACION_BONO * (t.pb if t.pb == t.pb else 0) / 10000,
+                    },
                     "moneda": None,
                     "fx": 0.0,
                 }
@@ -1151,9 +1215,21 @@ ACCIÓN REQUERIDA: {t.required_action}"""
     guardar(pd.DataFrame(rec_tw), "gold_recomendacion_twist")
     if not estres:
         # El twist no trae noticias de tasas ni de tipo de cambio: se deja constancia en vez de una tabla vacía
-        estres = [{"client_id": cid, "momento": "despues", "escenario": "sin escenarios de mercado", "descripcion": "",
-                   "impacto": 0.0, "limite_caida": 0.0, "cumple": True, "estado_motor": "", "pesos": "", "run_id": RUN_ID}
-                  for cid in clientes["client_id"]]
+        estres = [
+            {
+                "client_id": cid,
+                "momento": "despues",
+                "escenario": "sin escenarios de mercado",
+                "descripcion": "",
+                "impacto": 0.0,
+                "limite_caida": 0.0,
+                "cumple": True,
+                "estado_motor": "",
+                "pesos": "",
+                "run_id": RUN_ID,
+            }
+            for cid in clientes["client_id"]
+        ]
     guardar(pd.DataFrame(estres), "gold_estres_twist")
     display(
         pd.DataFrame(estres)[
@@ -1239,7 +1315,11 @@ for cid in clientes["client_id"]:
             "objetivo": objetivo_op,
             "idea": idea,
             "estado": o["estado"],
-            "n_empresas": sum(1 for a in pesos if not es_caja(a)),
+            "n_empresas": sum(1 for a in pesos if clase(a) == "Renta variable"),
+            "renta_fija": sum(w for a, w in pesos.items() if clase(a) == "Renta fija"),
+            "renta_variable": sum(
+                w for a, w in pesos.items() if clase(a) == "Renta variable"
+            ),
             "liquidez": sum(w for a, w in pesos.items() if es_caja(a)),
             "ret_total": o["metricas"]["ret_total"],
             "drawdown": o["metricas"]["drawdown"],
@@ -1271,6 +1351,35 @@ for cid in clientes["client_id"]:
 df_op = pd.DataFrame(opciones)
 guardar(df_op, "gold_opciones_cliente")
 guardar(pd.DataFrame(opciones_pesos), "gold_opciones_pesos")
+
+# Asignación por clase de activo (liquidez / renta fija / renta variable) de cada cartera: la vista del asesor
+carteras = [("recomendacion", rec)]
+if HAY_TWIST:
+    carteras.append(
+        ("despues_twist", [f for f in rec_tw if f.get("momento") == "despues"])
+    )
+carteras += [
+    (f"opcion:{op[0]}", [f for f in opciones_pesos if f["opcion"] == op[0]])
+    for op in OPCIONES
+]
+df_clases = pd.concat(
+    [
+        pd.DataFrame(f)
+        .groupby(["client_id", "clase"])["peso"]
+        .sum()
+        .reset_index()
+        .assign(cartera=c)
+        for c, f in carteras
+        if f
+    ],
+    ignore_index=True,
+)
+guardar(df_clases, "gold_recomendacion_clases")
+display(
+    df_clases[df_clases["client_id"] == CLIENTE_ELEGIDO]
+    .pivot_table(index="cartera", columns="clase", values="peso", fill_value=0)
+    .round(2)
+)
 display(df_op[df_op["client_id"] == CLIENTE_ELEGIDO].drop(columns=["run_id"]).round(3))
 
 # COMMAND ----------
@@ -1281,6 +1390,8 @@ display(df_op[df_op["client_id"] == CLIENTE_ELEGIDO].drop(columns=["run_id"]).ro
 MAX_PASOS = 14  # 8 consultas obligatorias + margen para una entrega rechazada
 PCT = [
     "impacto",
+    "renta_fija",
+    "renta_variable",
     "liquidez",
     "estres_twist",
     "vol",
@@ -1320,8 +1431,10 @@ def a_texto(df):
     )
     for c in d.columns:
         if c in PCT and pd.api.types.is_numeric_dtype(d[c]):
-            pct = (d[c] * 100).round(1).astype(str) + "%"
-            d[c] = np.where(conteo, d[c].round(0).astype(int).astype(str), pct)
+            # Vacíos (p. ej. margen EBITDA del bono, que no es una empresa) se dejan como "n/a"
+            pct = d[c].map(lambda v: "n/a" if pd.isna(v) else f"{v * 100:.1f}%")
+            entero = d[c].map(lambda v: "n/a" if pd.isna(v) else str(int(round(v))))
+            d[c] = np.where(conteo, entero, pct)
     return d.astype(str).to_json(orient="records", force_ascii=False)
 
 
@@ -1334,6 +1447,7 @@ HERRAMIENTAS = {
                 "sector",
                 "pais",
                 "papel",
+                "clase",
                 "peso",
                 "estado",
                 "objetivo",
@@ -1372,6 +1486,7 @@ HERRAMIENTAS = {
                 "max_drawdown",
                 "retorno_estres",
                 "papel",
+                "clase",
                 "margen_ebitda",
                 "deuda_neta_ebitda",
             ]
@@ -1426,16 +1541,46 @@ if HAY_TWIST:
     OBLIGATORIAS.add("ver_twist")
     # La recomendación vigente es la posterior al twist: ver_recomendacion la devuelve a ella
     HERRAMIENTAS["ver_recomendacion"] = lambda: a_texto(
-        leer("gold_recomendacion_twist").query("client_id == @CLIENTE_ELEGIDO and momento == 'despues'")[
-            ["asset_id", "nombre", "sector", "pais", "papel", "peso", "estado", "objetivo", "moneda_cliente",
-             "port_ret_total", "port_drawdown", "port_vol"]]
+        leer("gold_recomendacion_twist").query(
+            "client_id == @CLIENTE_ELEGIDO and momento == 'despues'"
+        )[
+            [
+                "asset_id",
+                "nombre",
+                "sector",
+                "pais",
+                "papel",
+                "clase",
+                "peso",
+                "estado",
+                "objetivo",
+                "moneda_cliente",
+                "port_ret_total",
+                "port_drawdown",
+                "port_vol",
+            ]
+        ]
     )
 
 # Menú de opciones: el brief las presenta para que el cliente elija cuánto riesgo adicional tomar
 HERRAMIENTAS["ver_opciones"] = lambda: a_texto(
     leer("gold_opciones_cliente").query("client_id == @CLIENTE_ELEGIDO")[
-        [c for c in ["opcion", "idea", "estado", "n_empresas", "liquidez", "ret_total", "drawdown", "estres_twist", "resiste_twist", "pesos"]
-         if c in leer("gold_opciones_cliente").columns]
+        [
+            c
+            for c in [
+                "opcion",
+                "idea",
+                "estado",
+                "n_empresas",
+                "liquidez",
+                "ret_total",
+                "drawdown",
+                "estres_twist",
+                "resiste_twist",
+                "pesos",
+            ]
+            if c in leer("gold_opciones_cliente").columns
+        ]
     ]
 )
 OBLIGATORIAS.add("ver_opciones")
@@ -1447,7 +1592,8 @@ Antes de entregar es OBLIGATORIO usar: {sorted(OBLIGATORIAS)}.
 Reglas:
 - Toda cifra debe copiarse tal cual de una herramienta y citar la tabla de donde sale.
 - No propongas pesos distintos a los de ver_recomendacion: el motor ya decidió.
-- "recomendacion": UN punto por cada posición con peso > 0, con nombre de la empresa (o tipo de caja), sector, país,
+- "recomendacion": el PRIMER punto resume la asignación por clase (Liquidez, Renta fija, Renta variable) con sus %
+  y por qué esa proporción (límite de caída, liquidez requerida, efecto de tasas en la renta fija). Luego UN punto por cada posición con peso > 0, con nombre de la empresa (o tipo de caja), sector, país,
   peso, y el porqué con al menos una métrica de ver_metricas (retorno_12m, max_drawdown, vol_anual o retorno_estres).
 - "senales": qué activos quedaron fuera y por qué (métrica o evento de ver_eventos), y qué evento explica movimientos.
 - "significado_cliente": qué implica la recomendación para este cliente (moneda, liquidez, límite de caída).
@@ -1468,7 +1614,9 @@ Responde SIEMPRE solo un JSON con una de estas formas:
   "riesgos_supuestos": [{{"texto": "", "tabla": ""}}]}}}}"""
 
 TABLA_DE = {
-    "ver_recomendacion": {"gold_recomendacion_twist" if HAY_TWIST else "gold_recomendacion"},
+    "ver_recomendacion": {
+        "gold_recomendacion_twist" if HAY_TWIST else "gold_recomendacion"
+    },
     "ver_cumplimiento": {"gold_cumplimiento"},
     "ver_metricas": {"gold_metricas_activo"},
     "ver_eventos": {"gold_impacto_eventos"},
@@ -1554,7 +1702,9 @@ else:
         print(f"Paso {paso}: {accion}")
 
     # Validación por código: la tabla citada debe haberse consultado y cada cifra debe aparecer en lo consultado
-    consultadas = set().union(*[TABLA_DE[t["accion"]] for t in traza if t["accion"] in TABLA_DE])
+    consultadas = set().union(
+        *[TABLA_DE[t["accion"]] for t in traza if t["accion"] in TABLA_DE]
+    )
     cifras_fuente = set(re.findall(r"-?\d+(?:\.\d+)?", historial))
     filas = []
     for seccion, items in (brief or {}).items():
@@ -1568,7 +1718,10 @@ else:
                     "texto": it.get("texto", ""),
                     "tabla": it.get("tabla", ""),
                     # Se acepta el nombre de la tabla o el de la herramienta que la consulta
-                    "tabla_consultada": bool(TABLA_DE.get(it.get("tabla", ""), {it.get("tabla", "")}) & consultadas),
+                    "tabla_consultada": bool(
+                        TABLA_DE.get(it.get("tabla", ""), {it.get("tabla", "")})
+                        & consultadas
+                    ),
                     "cifras_sin_respaldo": ",".join(sin_respaldo),
                     "run_id": RUN_ID,
                 }

@@ -66,6 +66,7 @@ flowchart LR
     gold_estres_twist["gold_estres_twist"]
     gold_opciones_cliente["gold_opciones_cliente"]
     gold_opciones_pesos["gold_opciones_pesos"]
+    gold_recomendacion_clases["gold_recomendacion_clases"]
     agx(["Agente explicador · Gemini"])
     gold_brief_cliente["gold_brief_cliente"]
   end
@@ -108,6 +109,10 @@ flowchart LR
   silver_twist -- "escenarios tasas / FX" --> gold_estres_twist
   gold_reglas_twist --> gold_opciones_cliente
   gold_opciones_cliente --> gold_opciones_pesos
+  gold_opciones_pesos --> gold_recomendacion_clases
+  gold_recomendacion --> gold_recomendacion_clases
+  gold_recomendacion_clases --> dash
+  silver_macro -- "tasa 10Y: bono sintético" --> motor
   gold_opciones_cliente --> dash
   gold_recomendacion --> agx
   gold_cumplimiento --> agx
@@ -132,7 +137,7 @@ flowchart LR
   class c1,c1x,c2,c3,c4,c5,c6,c7 csv
   class bronze_mercado_diario,bronze_mercado_intradia,bronze_macro,bronze_fundamentales,bronze_activos,bronze_clientes,bronze_eventos,bronze_twist bronze
   class silver_mercado_diario,silver_mercado_intradia,silver_mercado_intradia_diario,silver_macro,silver_fundamentales,silver_activos,silver_clientes,silver_eventos,silver_twist,silver_coherencia_fuentes,silver_bitacora_calidad silver
-  class gold_metricas_activo,gold_impacto_eventos,gold_reglas_propuestas,gold_reglas_cliente,gold_recomendacion,gold_cumplimiento,gold_backtest,gold_sensibilidad,gold_reglas_twist,gold_recomendacion_twist,gold_estres_twist,gold_opciones_cliente,gold_opciones_pesos,gold_brief_cliente gold
+  class gold_metricas_activo,gold_impacto_eventos,gold_reglas_propuestas,gold_reglas_cliente,gold_recomendacion,gold_cumplimiento,gold_backtest,gold_sensibilidad,gold_reglas_twist,gold_recomendacion_twist,gold_estres_twist,gold_opciones_cliente,gold_opciones_pesos,gold_recomendacion_clases,gold_brief_cliente gold
   class agt,agx agente
   class motor motorc
   class dash dashc

@@ -60,6 +60,7 @@ TABLAS = {
     "gold_estres_twist": ("Gold", "Escenarios de tasas y tipo de cambio"),
     "gold_opciones_cliente": ("Gold", "Menú Conservadora / Balanceada / Crecimiento"),
     "gold_opciones_pesos": ("Gold", "Pesos de cada opción"),
+    "gold_recomendacion_clases": ("Gold", "Liquidez / renta fija / renta variable por cartera"),
     "gold_brief_cliente": ("Gold", "Brief del agente para el dashboard"),
     "gold_traza_agente": ("Gold", "Pasos del agente explicador"),
 }
@@ -143,6 +144,7 @@ MERMAID = f"""flowchart LR
     {n("gold_estres_twist")}
     {n("gold_opciones_cliente")}
     {n("gold_opciones_pesos")}
+    {n("gold_recomendacion_clases")}
     agx(["Agente explicador · Gemini"])
     {n("gold_brief_cliente")}
   end
@@ -185,6 +187,10 @@ MERMAID = f"""flowchart LR
   silver_twist -- "escenarios tasas / FX" --> gold_estres_twist
   gold_reglas_twist --> gold_opciones_cliente
   gold_opciones_cliente --> gold_opciones_pesos
+  gold_opciones_pesos --> gold_recomendacion_clases
+  gold_recomendacion --> gold_recomendacion_clases
+  gold_recomendacion_clases --> dash
+  silver_macro -- "tasa 10Y: bono sintético" --> motor
   gold_opciones_cliente --> dash
   gold_recomendacion --> agx
   gold_cumplimiento --> agx
