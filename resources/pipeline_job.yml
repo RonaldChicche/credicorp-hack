@@ -1,0 +1,25 @@
+resources:
+  jobs:
+    pipeline_job:
+      name: credicorp_pipeline_${bundle.target}
+      tasks:
+        - task_key: limpieza
+          notebook_task:
+            notebook_path: ../notebooks/exploracion/explorar_datos.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
+        - task_key: analisis
+          depends_on:
+            - task_key: limpieza
+          notebook_task:
+            notebook_path: ../notebooks/analisis/analisis_portafolio.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
