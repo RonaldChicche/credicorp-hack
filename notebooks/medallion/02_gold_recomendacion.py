@@ -39,6 +39,14 @@ CATALOG, SCHEMA = dbutils.widgets.get("catalog"), dbutils.widgets.get("schema")
 FUENTE = dbutils.widgets.get("fuente_precios").strip().lower()
 CLIENTE_ELEGIDO = dbutils.widgets.get("cliente_elegido").strip()
 BRIEF_CLIENTES = dbutils.widgets.get("brief_clientes").strip()
+# Carteras que propone el equipo para comparar con el motor (JSON). Claves aceptadas: código (VF_A05),
+# nombre (Aurora Health), LIQUIDEZ (caja en la moneda del cliente), CAJA_USD, BONO. Ejemplo de un compañero:
+dbutils.widgets.text(
+    "carteras_equipo",
+    '{"Equipo: 35% liquidez, 25% Aurora": {"cliente": "CL_02", "pesos": '
+    '{"LIQUIDEZ": 0.35, "Aurora Health": 0.25, "Lima Financial": 0.30, "BONO": 0.10}}}',
+)
+CARTERAS_EQUIPO = dbutils.widgets.get("carteras_equipo").strip()
 AUTO_APROBAR = dbutils.widgets.get("auto_aprobar_reglas").strip().lower() == "si"
 DB = f"{CATALOG}.{SCHEMA}"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -869,10 +877,33 @@ def optimizar(
     md, resd = evaluar(Wd, R, universo, alta_vol, restricciones)
     factible_d = cumple_todo(resd) if resd else np.ones(len(Wd), bool)
     if factible_d.any():
-        elegido, estado = (
-            Wd[np.argmax(np.where(factible_d, puntuar(md), -np.inf))],
-            "OK",
-        )
+        # Desempate: entre las mezclas que empatan con la mejor (dentro de una tolerancia pequeña),
+        # gana la de menor caída. A igual retorno, el cliente prefiere caer menos.
+        punt = np.where(factible_d, puntuar(md), -np.inf)
+        tol = {"max_retorno": 0.002, "max_sharpe": 0.01, "min_volatilidad": 0.001}[objetivo]
+        empatadas = np.flatnonzero(punt >= punt.max() - tol)
+        elegido, estado = Wd[empatadas[np.argmax(md["drawdown"][empatadas])]], "OK"
+        # Ajuste fino: probar todos los movimientos de 5 puntos entre dos posiciones y aceptar el que
+        # mejore el objetivo (o lo iguale con menor caída). Termina cuando ningún movimiento mejora:
+        # así cada peso presentado es el mejor frente a sus variantes de 5 puntos.
+        for _ in range(60):
+            m0, _r = evaluar(elegido[None, :], R, universo, alta_vol, restricciones)
+            p0, d0 = puntuar(m0)[0], m0["drawdown"][0]
+            idx = [(i, j) for i in range(len(universo)) for j in range(len(universo))
+                   if i != j and elegido[j] >= PASO_PESO - 1e-9]
+            C = np.repeat(elegido[None, :], len(idx), axis=0)
+            for f, (i, j) in enumerate(idx):
+                C[f, i] += PASO_PESO
+                C[f, j] -= PASO_PESO
+            C = np.round(C, 10)
+            mc, rcc = evaluar(C, R, universo, alta_vol, restricciones)
+            ok = cumple_todo(rcc) if rcc else np.ones(len(C), bool)
+            pc = puntuar(mc)
+            mejor = ok & ((pc > p0 + tol) | ((pc >= p0) & (mc["drawdown"] > d0 + 1e-4)))
+            if not mejor.any():
+                break
+            cand = np.flatnonzero(mejor)
+            elegido = C[cand[np.lexsort((mc["drawdown"][cand], pc[cand]))[-1]]]
     else:
         # Ninguna mezcla cumple: se reporta la que menos incumple, para mostrar qué regla es imposible
         elegido, estado = Wd[np.argmin(violacion(resd))], "SIN_SOLUCION_FACTIBLE"
@@ -1148,6 +1179,25 @@ ACCIÓN REQUERIDA: {t.required_action}"""
                 }
             )
 
+    # Colchón cambiario: si el twist también trae un shock de la moneda del cliente (TW_03: COP -8%), la
+    # liquidez que retirará se protege contra su reversión: necesidad × (1 + shock), redondeado hacia arriba
+    # a múltiplos de 5%. Ej. CL_02: 30% × 1.08 = 32.4% -> 35% (30% que retira + 5% de colchón).
+    fx_shock = {str(t.field).split("_")[-1].upper(): t.pct / 100
+                for t in tw[tw["tipo"] == "FX"].itertuples() if t.pct == t.pct}
+    moneda_de = clientes.set_index("client_id")["base_currency"].to_dict()
+    for n_ in nuevas:
+        choque = fx_shock.get(moneda_de.get(n_["client_id"]))
+        if n_["rule_type"] in ("MIN_CAJA", "MIN_CAJA_LOCAL") and choque and n_["origen"].startswith("twist:"):
+            base_l = n_["params"]["limite"]
+            con_colchon = min(1.0, np.ceil(round(base_l * (1 + choque) / PASO_PESO, 6)) * PASO_PESO)
+            if con_colchon > base_l:
+                n_["params"] = {"limite": round(con_colchon, 2)}
+                n_["origen"] += ":colchon_fx"
+                n_["supuesto"] = True
+                n_["evidencia_texto"] = (f"{base_l:.0%} que retirará + colchón por shock cambiario de {choque:.0%}: "
+                                         f"{base_l:.0%} × {1 + choque:.2f} = {base_l * (1 + choque):.1%} -> {con_colchon:.0%}")
+                print(f"{n_['client_id']}: {n_['rule_type']} {base_l:.0%} -> {con_colchon:.0%} ({n_['evidencia_texto']})")
+
     reglas_twist = reglas.copy()
     for n_ in nuevas:
         reglas_twist = reglas_twist[
@@ -1231,9 +1281,11 @@ ACCIÓN REQUERIDA: {t.required_action}"""
     # Todos los clientes: así cambiar de cliente en el dashboard no requiere volver a correr nada
     afectados = list(clientes["client_id"])
     rec_tw, estres = [], []
+    resultados_twist = {}
     for cid in clientes["client_id"]:
         antes = resultados[cid]
         despues = optimizar(cid, reglas_twist, close) if cid in afectados else antes
+        resultados_twist[cid] = despues
         if cid in afectados:
             rec_tw += filas_recomendacion(cid, antes, momento="antes")
             rec_tw += filas_recomendacion(cid, despues, momento="despues")
@@ -1326,6 +1378,7 @@ OPCIONES = [
 ]
 reglas_base = reglas_twist if HAY_TWIST else reglas
 opciones, opciones_pesos = [], []
+resultados_opciones = {}
 for cid in clientes["client_id"]:
     for nombre_op, objetivo_op, tope_activo, idea in OPCIONES:
         rr = reglas_base[
@@ -1361,6 +1414,7 @@ for cid in clientes["client_id"]:
         o = optimizar(
             cid, pd.concat([rr, pd.DataFrame(extra)], ignore_index=True), close
         )
+        resultados_opciones[(cid, nombre_op)] = o
         pesos = {a: w for a, w in zip(o["universo"], o["pesos"]) if w > 0}
         fila = {
             "client_id": cid,
@@ -1437,12 +1491,209 @@ display(df_op[df_op["client_id"] == CLIENTE_ELEGIDO].drop(columns=["run_id"]).ro
 
 # COMMAND ----------
 
+# ===== CELDA 7D: ¿POR QUÉ ESE PORCENTAJE? (gold_justificacion_pesos) =====
+# Para cada posición se calcula con datos: cuánto aporta al retorno y al riesgo, qué pasa si sube o baja
+# 5 puntos (contra la caja, o contra la mayor acción si es caja) y qué regla fija ese peso.
+# Así el porqué de "30% en liquidez" o "40% en Aurora Health" no depende del agente.
+PASO_PRUEBA = 0.05
+
+
+def incumplidas(res, reglas_c):
+    nombres = {r["clave"]: f"{r['rule_type']} {json.dumps(r['params'], ensure_ascii=False)}" for r in reglas_c}
+    return [nombres[k] for k, (v, lim, sent) in res.items()
+            if (v[0] > lim + 1e-9 if sent == "max" else v[0] < lim - 1e-9)]
+
+
+def justificar(cid, o, cartera):
+    u, w, R = o["universo"], np.array(o["pesos"], dtype=float), o["R"].values
+    acciones = [a for a in u if not es_caja(a)]
+    av = np.array([float(o["alta_vol"][a]) for a in acciones])
+    rc = o["reglas"]
+    P = R @ w
+    m0, _ = evaluar(w[None, :], R, u, av, rc)
+    ret0 = m0["ret_total"][0]
+    # Se compara con la misma medida que optimiza el motor para esta cartera
+    medida = {"max_retorno": ("ret_anual", 1, 0.002, "retorno anual"), "max_sharpe": ("sharpe", 1, 0.01, "Sharpe"),
+              "min_volatilidad": ("vol", -1, 0.001, "volatilidad")}[o["objetivo"]]
+    obj0 = medida[1] * m0[medida[0]][0]
+    dd_lim = next(r["params"]["limite"] for r in rc if r["rule_type"] == "DD_MAX")
+    con_peso = [a for a in u if w[u.index(a)] > 0]
+    filas_j = []
+    for j, a in enumerate(u):
+        if w[j] <= 0:
+            continue
+        # Contraparte: una inversión se compara contra la otra inversión de mayor peso (explica el reparto
+        # entre ellas); la caja, contra la inversión de mayor peso (explica cuánto se invierte)
+        otras = [x for x in con_peso if not es_caja(x) and x != a]
+        cajas = [x for x in con_peso if es_caja(x)]
+        contra = max(otras, key=lambda x: w[u.index(x)]) if otras else (cajas[0] if cajas else None)
+        pruebas, rotas_dir, mejora, prudente = {}, {"sube": [], "baja": []}, False, []
+        for nombre_p, d in (("sube", PASO_PRUEBA), ("baja", -PASO_PRUEBA)):
+            w2 = w.copy()
+            if contra is None:
+                pruebas[nombre_p] = "no aplica"
+                continue
+            w2[j] += d
+            w2[u.index(contra)] -= d
+            if (w2 < -1e-9).any():
+                pruebas[nombre_p] = "no aplica"
+                continue
+            m2, res2 = evaluar(w2[None, :], R, u, av, rc)
+            rotas = incumplidas(res2, rc)
+            rotas_dir[nombre_p] = rotas
+            # Diferencias de retorno menores a 0.2 puntos se consideran empate
+            d_obj = medida[1] * m2[medida[0]][0] - obj0
+            d_ret, d_dd = m2["ret_total"][0] - ret0, m2["drawdown"][0] - m0["drawdown"][0]
+            mejora |= (not rotas) and d_obj > medida[2]
+            if not rotas and abs(d_obj) <= medida[2] and d_dd > 1e-4:
+                prudente.append(f"con 5 puntos {'más' if d > 0 else 'menos'} el {medida[3]} casi no cambia "
+                                f"(retorno {d_ret * 100:+.1f} pp) y la caída mejora a {m2['drawdown'][0]:.1%}")
+            pruebas[nombre_p] = (f"retorno {m2['ret_total'][0]:.1%}, caída {m2['drawdown'][0]:.1%}"
+                                 + (f"; incumple {', '.join(rotas)}" if rotas else "; cumple todas las reglas"))
+        fijan = sorted(set(rotas_dir["sube"] + rotas_dir["baja"]))
+        limites = []
+        if rotas_dir["sube"]:
+            limites.append(f"no puede subir 5 puntos sin incumplir {'; '.join(rotas_dir['sube'])}")
+        if rotas_dir["baja"]:
+            limites.append(f"no puede bajar 5 puntos sin incumplir {'; '.join(rotas_dir['baja'])}")
+        ret_a = float((1 + R[:, j]).prod() - 1)
+        aporte_riesgo = float(w[j] * np.cov(R[:, j], P)[0, 1] / P.var(ddof=1)) if P.var(ddof=1) > 0 else 0.0
+        nombre = {"CAJA": "Caja (depósito USD)", "CAJA_LOCAL": f"Caja en {o['moneda']}"}.get(a) or INFO.at[a, "name"]
+        if limites:
+            motivo = "Peso acotado por las reglas: " + "; ".join(limites) + "."
+        elif mejora:
+            # Con pesos en múltiplos de 5% puede existir una variante algo mejor que la búsqueda no eligió
+            motivo = f"Ninguna regla lo fija y una variante de 5 puntos mejora el {medida[3]}: el peso es aproximado."
+        elif prudente:
+            motivo = ("Ninguna regla lo fija; alternativa casi equivalente y más prudente: " + "; ".join(prudente)
+                      + ". Útil si el cliente prefiere caer menos (ver opción Balanceada).")
+        else:
+            motivo = (f"Ninguna regla lo fija: moverlo 5 puntos empeora el {medida[3]}, así que es el mejor peso "
+                      f"para el objetivo {o['objetivo']} dentro del límite de caída de {dd_lim:.0%}.")
+        razon = (f"{nombre} {w[j]:.0%} ({clase(a)}). Rindió {ret_a:.1%} en el año en {o['moneda']}; aporta "
+                 f"{w[j] * ret_a:+.1%} al retorno y {aporte_riesgo:.0%} del riesgo del portafolio. "
+                 f"Con 5 puntos más (contra {contra}): {pruebas.get('sube', 'no aplica')}. "
+                 f"Con 5 puntos menos: {pruebas.get('baja', 'no aplica')}. {motivo}")
+        filas_j.append({"client_id": cid, "cartera": cartera, "asset_id": a, "nombre": nombre, "clase": clase(a),
+                        "peso": w[j], "ret_activo": ret_a, "aporte_retorno": w[j] * ret_a, "aporte_riesgo": aporte_riesgo,
+                        "contraparte": contra or "", "si_sube_5pp": pruebas.get("sube", "no aplica"),
+                        "si_baja_5pp": pruebas.get("baja", "no aplica"), "reglas_que_lo_fijan": "; ".join(fijan),
+                        "razon": razon, "run_id": RUN_ID})
+    return filas_j
+
+
+just = []
+for cid in clientes["client_id"]:
+    just += justificar(cid, resultados[cid], "recomendacion")
+    if HAY_TWIST:
+        just += justificar(cid, resultados_twist[cid], "despues_twist")
+    for op in OPCIONES:
+        just += justificar(cid, resultados_opciones[(cid, op[0])], f"opcion:{op[0]}")
+df_just = pd.DataFrame(just)
+guardar(df_just, "gold_justificacion_pesos")
+cartera_final = "despues_twist" if HAY_TWIST else "recomendacion"
+for r in df_just[(df_just["client_id"] == CLIENTE_ELEGIDO) & (df_just["cartera"] == cartera_final)].itertuples():
+    print("•", r.razon)
+
+# COMMAND ----------
+
+# ===== CELDA 7E: CARTERAS PROPUESTAS POR EL EQUIPO (gold_carteras_equipo) =====
+# Cualquier reparto que proponga alguien (widget carteras_equipo) se evalúa igual que el del motor:
+# si cumple las reglas del cliente, retorno, caída, estrés del twist, el porqué de cada % y la diferencia
+# con la recomendación. Así se discute con datos "35% en liquidez y 25% en Aurora" frente a la del motor.
+
+
+def a_columna(clave, o):
+    # Traduce lo que escribe una persona al código del universo del cliente
+    k = str(clave).strip()
+    alias = {"LIQUIDEZ": "CAJA_LOCAL" if "CAJA_LOCAL" in o["universo"] else "CAJA", "CAJA_USD": "CAJA",
+             "CAJA": "CAJA", "CAJA_LOCAL": "CAJA_LOCAL", "BONO": BONO, BONO: BONO}
+    col = alias.get(k.upper()) or (k if k in o["universo"] else None)
+    if col is None:
+        coincide = [a for a in o["universo"] if a in INFO.index and str(INFO.at[a, "name"]).lower() == k.lower()]
+        col = coincide[0] if len(coincide) == 1 else None  # nombre ambiguo o desconocido: no se adivina
+    return col if col in o["universo"] else None
+
+
+try:
+    propuestas_eq = json.loads(CARTERAS_EQUIPO) if CARTERAS_EQUIPO else {}
+except json.JSONDecodeError as e:
+    propuestas_eq = {}
+    print("carteras_equipo no es un JSON válido:", e)
+
+evaluadas, just_eq = [], []
+for nombre_c, cfg in propuestas_eq.items():
+    cid = cfg.get("cliente")
+    if cid not in set(clientes["client_id"]):
+        print(f"'{nombre_c}': cliente {cid} no existe; se omite.")
+        continue
+    ref = resultados_twist[cid] if HAY_TWIST else resultados[cid]  # reglas vigentes del cliente
+    u = ref["universo"]
+    w = np.zeros(len(u))
+    no_reconocidos = []
+    for clave, peso in cfg.get("pesos", {}).items():
+        col = a_columna(clave, ref)
+        if col is None:
+            no_reconocidos.append(clave)
+        else:
+            w[u.index(col)] += float(peso)
+    if abs(w.sum() - 100) < 1e-6:
+        w = w / 100  # escrito en porcentaje (35, 25, ...): se pasa a fracción
+        print(f"'{nombre_c}': pesos escritos en %, se convierten a fracción.")
+    if (w < 0).any() or (w > 1).any() or not np.isfinite(w).all():
+        print(f"'{nombre_c}': cada peso debe estar entre 0 y 1 (sin cortos ni apalancamiento); se omite.")
+        continue
+    if no_reconocidos or abs(w.sum() - 1) > 1e-6:
+        print(f"'{nombre_c}': no reconocidos {no_reconocidos}, suma {w.sum():.0%}. Debe sumar 100% con nombres del universo.")
+        continue
+    acciones_c = [a for a in u if not es_caja(a)]
+    av = np.array([float(ref["alta_vol"][a]) for a in acciones_c])
+    m, res_c = evaluar(w[None, :], ref["R"].values, u, av, ref["reglas"])
+    rotas = incumplidas(res_c, ref["reglas"])
+    aplica = [e for e in escenarios if e["moneda"] in (None, ref["moneda"])] if HAY_TWIST else []
+    estres_c = impacto(w, u, ref["moneda"], aplica) if aplica else np.nan
+    dd_lim = next(r["params"]["limite"] for r in ref["reglas"] if r["rule_type"] == "DD_MAX")
+    estres_ref = impacto(ref["pesos"], u, ref["moneda"], aplica) if aplica else np.nan
+    veredicto = ("Cumple todas las reglas del cliente" if not rotas else f"Incumple: {'; '.join(rotas)}")
+    if aplica and -estres_c > dd_lim:
+        veredicto += f". No resiste el twist combinado ({estres_c:.1%} frente al límite de {dd_lim:.0%})"
+    evaluadas.append({
+        "client_id": cid, "cartera": nombre_c, "pesos": json.dumps({a: round(x, 2) for a, x in zip(u, w) if x > 0}),
+        "liquidez": sum(x for a, x in zip(u, w) if es_caja(a)),
+        "renta_fija": sum(x for a, x in zip(u, w) if clase(a) == "Renta fija"),
+        "renta_variable": sum(x for a, x in zip(u, w) if clase(a) == "Renta variable"),
+        "ret_total": m["ret_total"][0], "drawdown": m["drawdown"][0], "vol": m["vol"][0], "estres_twist": estres_c,
+        "cumple": not rotas and not (aplica and -estres_c > dd_lim), "veredicto": veredicto,
+        "ret_motor": ref["metricas"]["ret_total"], "drawdown_motor": ref["metricas"]["drawdown"], "estres_motor": estres_ref,
+        "dif_retorno_vs_motor": m["ret_total"][0] - ref["metricas"]["ret_total"],
+        "dif_caida_vs_motor": m["drawdown"][0] - ref["metricas"]["drawdown"], "run_id": RUN_ID,
+    })
+    just_eq += justificar(cid, {**ref, "pesos": w}, f"equipo:{nombre_c}")
+
+if evaluadas:
+    df_eq = pd.DataFrame(evaluadas)
+    guardar(df_eq, "gold_carteras_equipo")
+    df_just = pd.concat([df_just, pd.DataFrame(just_eq)], ignore_index=True)
+    guardar(df_just, "gold_justificacion_pesos")
+    for r in df_eq.itertuples():
+        print(f"{r.cartera} [{r.client_id}] → {r.veredicto}. Retorno {r.ret_total:.1%} (motor {r.ret_motor:.1%}), "
+              f"caída {r.drawdown:.1%} (motor {r.drawdown_motor:.1%}), twist {r.estres_twist:.1%} (motor {r.estres_motor:.1%}).")
+        for j in just_eq:
+            if j["cartera"] == f"equipo:{r.cartera}":
+                print("   •", j["razon"])
+
+# COMMAND ----------
+
 # ===== CELDA 8: AGENTE EXPLICADOR (brief del cliente elegido, citando tablas Gold) =====
 # Mismo ciclo que el agente investigador: Gemini pide una herramienta, el código la ejecuta.
 # Las secciones responden las 5 preguntas del Decision Dashboard.
-MAX_PASOS = 14  # 8 consultas obligatorias + margen para una entrega rechazada
+MAX_PASOS = 16  # 10 consultas obligatorias + margen para una entrega rechazada
 PCT = [
     "impacto",
+    "ret_motor",
+    "drawdown_motor",
+    "aporte_retorno",
+    "aporte_riesgo",
     "renta_fija",
     "renta_variable",
     "liquidez",
@@ -1638,6 +1889,19 @@ HERRAMIENTAS["ver_opciones"] = lambda: a_texto(
 )
 OBLIGATORIAS.add("ver_opciones")
 
+# El porqué de cada porcentaje, calculado por código (celda 7D)
+HERRAMIENTAS["ver_justificacion"] = lambda: a_texto(
+    leer("gold_justificacion_pesos").query(
+        "client_id == @CLIENTE_ELEGIDO and cartera == @cartera_final")[
+        ["asset_id", "nombre", "clase", "peso", "aporte_retorno", "aporte_riesgo", "razon"]]
+)
+OBLIGATORIAS.add("ver_justificacion")
+if spark.catalog.tableExists(f"{DB}.gold_carteras_equipo") and evaluadas:
+    # Carteras del equipo para este cliente: el brief las compara con la del motor
+    HERRAMIENTAS["ver_carteras_equipo"] = lambda: a_texto(
+        leer("gold_carteras_equipo").query("client_id == @CLIENTE_ELEGIDO")[
+            ["cartera", "pesos", "ret_total", "drawdown", "estres_twist", "veredicto", "ret_motor", "drawdown_motor"]])
+
 
 def instrucciones_para(CLIENTE_ELEGIDO):
     return f"""Eres analista de inversiones. Prepara el brief de la recomendación para el cliente {CLIENTE_ELEGIDO}.
@@ -1649,12 +1913,15 @@ Reglas:
 - No propongas pesos distintos a los de ver_recomendacion: el motor ya decidió.
 - "recomendacion": el PRIMER punto resume la asignación por clase (Liquidez, Renta fija, Renta variable) con sus %
   y por qué esa proporción (límite de caída, liquidez requerida, efecto de tasas en la renta fija). Luego UN punto por cada posición con peso > 0, con nombre de la empresa (o tipo de caja), sector, país,
-  peso, y el porqué con al menos una métrica de ver_metricas (retorno_12m, max_drawdown, vol_anual o retorno_estres).
+  peso, y el porqué de ESE porcentaje tomado de ver_justificacion (razon: aporte al retorno y al riesgo, qué pasa
+  con 5 puntos más o menos y qué regla lo fija), más una métrica de ver_metricas.
 - "senales": qué activos quedaron fuera y por qué (métrica o evento de ver_eventos), y qué evento explica movimientos.
 - "significado_cliente": qué implica la recomendación para este cliente (moneda, liquidez, límite de caída).
 - En "recomendacion", después de las posiciones, agrega UN punto por cada opción de ver_opciones (Conservadora,
   Balanceada, Crecimiento) con su retorno, caída y si resiste el twist, para que el cliente elija cuánto riesgo tomar.
 - En "tabla" escribe el nombre de la herramienta que usaste (ej. ver_metricas).
+- Si existe ver_carteras_equipo y trae carteras de este cliente: en "senales" compara cada una con la del motor
+  (retorno, caída, twist y veredicto) y di por qué se recomienda una u otra.
 - Si estado = SIN_SOLUCION_FACTIBLE, dilo y explica qué regla no se puede cumplir.
 - "riesgos_supuestos" debe incluir la fuente de precios y cualquier regla con supuesto = true o al límite.
 - Si existe ver_twist: la recomendación final es la de momento = despues; explica qué noticia la cambió
@@ -1681,6 +1948,8 @@ TABLA_DE = {
     "ver_cliente": {"silver_clientes"},
     "ver_twist": {"silver_twist", "gold_recomendacion_twist", "gold_estres_twist"},
     "ver_opciones": {"gold_opciones_cliente"},
+    "ver_justificacion": {"gold_justificacion_pesos"},
+    "ver_carteras_equipo": {"gold_carteras_equipo"},
 }
 
 # Escalable: un brief por cliente (widget brief_clientes = "todos" o una lista "CL_01,CL_03").

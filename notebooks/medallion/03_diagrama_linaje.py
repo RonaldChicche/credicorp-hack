@@ -61,6 +61,8 @@ TABLAS = {
     "gold_opciones_cliente": ("Gold", "Menú Conservadora / Balanceada / Crecimiento"),
     "gold_opciones_pesos": ("Gold", "Pesos de cada opción"),
     "gold_recomendacion_clases": ("Gold", "Liquidez / renta fija / renta variable por cartera"),
+    "gold_justificacion_pesos": ("Gold", "Por qué cada %: aporte, prueba de ±5 puntos y regla que lo fija"),
+    "gold_carteras_equipo": ("Gold", "Carteras propuestas por el equipo vs. el motor"),
     "gold_brief_cliente": ("Gold", "Brief del agente para el dashboard"),
     "gold_traza_agente": ("Gold", "Pasos del agente explicador"),
 }
@@ -145,6 +147,9 @@ MERMAID = f"""flowchart LR
     {n("gold_opciones_cliente")}
     {n("gold_opciones_pesos")}
     {n("gold_recomendacion_clases")}
+    {n("gold_justificacion_pesos")}
+    {n("gold_carteras_equipo")}
+    eq[/"Carteras del equipo · widget"/]
     agx(["Agente explicador · Gemini"])
     {n("gold_brief_cliente")}
   end
@@ -190,6 +195,15 @@ MERMAID = f"""flowchart LR
   gold_opciones_pesos --> gold_recomendacion_clases
   gold_recomendacion --> gold_recomendacion_clases
   gold_recomendacion_clases --> dash
+  gold_recomendacion --> gold_justificacion_pesos
+  gold_opciones_cliente --> gold_justificacion_pesos
+  eq --> gold_carteras_equipo
+  gold_reglas_twist --> gold_carteras_equipo
+  gold_carteras_equipo --> gold_justificacion_pesos
+  gold_justificacion_pesos --> agx
+  gold_carteras_equipo --> agx
+  gold_justificacion_pesos --> dash
+  gold_carteras_equipo --> dash
   silver_macro -- "tasa 10Y: bono sintético" --> motor
   gold_opciones_cliente --> dash
   gold_recomendacion --> agx
