@@ -31,12 +31,14 @@ dbutils.widgets.text(
     "fuente_precios", "diario"
 )  # diario | intradia: el diario es el coherente con macro (ver silver_coherencia_fuentes)
 dbutils.widgets.text("cliente_elegido", "CL_02")
+dbutils.widgets.text("brief_clientes", "todos")  # "todos" o lista: CL_01,CL_03
 dbutils.widgets.text(
     "auto_aprobar_reglas", "si"
 )  # "no" deja las reglas del agente en estado propuesta
 CATALOG, SCHEMA = dbutils.widgets.get("catalog"), dbutils.widgets.get("schema")
 FUENTE = dbutils.widgets.get("fuente_precios").strip().lower()
 CLIENTE_ELEGIDO = dbutils.widgets.get("cliente_elegido").strip()
+BRIEF_CLIENTES = dbutils.widgets.get("brief_clientes").strip()
 AUTO_APROBAR = dbutils.widgets.get("auto_aprobar_reglas").strip().lower() == "si"
 DB = f"{CATALOG}.{SCHEMA}"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -139,7 +141,9 @@ def retorno_bono(indice):
     # Retorno diario de un bono a 10 años a partir de su tasa (no hay precios de bonos en el caso):
     # cupón diario (tasa del día anterior / 252) menos duración × cambio de tasa.
     # Si la tasa sube, el precio del bono cae; si baja, sube.
-    y = (macro["us_10y_yield"] / 100).reindex(indice, method="ffill")  # usa el último dato macro conocido
+    y = (macro["us_10y_yield"] / 100).reindex(
+        indice, method="ffill"
+    )  # usa el último dato macro conocido
     return (y.shift(1) / 252 - DURACION_BONO * y.diff()).iloc[1:].fillna(0.0)
 
 
@@ -153,7 +157,9 @@ def duracion_modificada(tasa, anios=10, pagos=2):
 
 # Con la tasa a la fecha de corte (02_macro_raw.csv)
 DURACION_BONO = duracion_modificada(macro["us_10y_yield"].dropna().iloc[-1] / 100)
-print(f"Duración del bono a 10 años: {DURACION_BONO:.2f} (tasa {macro['us_10y_yield'].dropna().iloc[-1]:.2f}%)")
+print(
+    f"Duración del bono a 10 años: {DURACION_BONO:.2f} (tasa {macro['us_10y_yield'].dropna().iloc[-1]:.2f}%)"
+)
 
 
 def panel_precios(fuente):
@@ -431,47 +437,95 @@ for c in clientes.itertuples():
         }
     )
 
-# Reglas manuales: respaldo si el agente no está disponible y punto de comparación si lo está
-MANUALES = {
-    "CL_01": [
-        ("MAX_POR_SECTOR", {"limite": 0.45}, "Máx. 45% en un solo sector", False),
+# Reglas de respaldo GENERADAS desde el perfil (no escritas a mano por cliente): un cliente nuevo en
+# 05_client_profiles.csv funciona aunque el agente esté apagado. También sirven para comparar con el agente.
+# Políticas de la casa (supuestos declarados): cuánta caja exige cada nivel de liquidez y cuánta
+# caja máxima admite cada tolerancia al riesgo, para que el cliente esté invertido.
+MIN_CAJA_POR_LIQUIDEZ = {"baja": 0.0, "media": 0.10, "alta": 0.20}
+MAX_CAJA_POR_RIESGO = {"alta": 0.10, "media": 0.30, "media-baja": 0.60, "baja": 0.80}
+PATRONES_RESTRICCION = [
+    # (regex sobre el texto de "constraint", función que arma la regla)
+    (
+        r"m[aá]x\.?\s*(\d+)\s*%\s*en un solo sector",
+        lambda m: ("MAX_POR_SECTOR", {"limite": int(m[1]) / 100}),
+    ),
+    (
+        r"m[aá]x\.?\s*(\d+)\s*%\s*en un solo pa[ií]s",
+        lambda m: ("MAX_POR_PAIS", {"limite": int(m[1]) / 100}),
+    ),
+    (
+        r"m[aá]x\.?\s*(\d+)\s*%\s*en (?:un solo activo|una sola empresa)",
+        lambda m: ("MAX_PESO_ACTIVO", {"limite": int(m[1]) / 100}),
+    ),
+    (
+        r"m[aá]x\.?\s*(\d+)\s*%\s*en activos de alta volatilidad",
+        lambda m: ("MAX_GRUPO", {"grupo": "alta_vol", "limite": int(m[1]) / 100}),
+    ),
+    (
+        r"al menos\s*(\d+)\s*pa[ií]ses",
+        lambda m: ("MIN_PAISES", {"n": int(m[1]), "peso_min": 0.05}),
+    ),
+    (
+        r"(\d+)\s*sectores",
+        lambda m: ("MIN_SECTORES", {"n": int(m[1]), "peso_min": 0.05}),
+    ),
+]
+
+
+def reglas_desde_perfil(c):
+    reglas_c = []
+    texto = str(c.constraint)
+    for patron, armar_regla in PATRONES_RESTRICCION:
+        m = re.search(patron, texto, re.I)
+        if m:
+            t, p = armar_regla(m)
+            reglas_c.append((t, p, m.group(0), False))
+    if not reglas_c and texto.strip():
+        print(
+            f"{c.client_id}: restricción no reconocida '{texto}'. Agrégala a PATRONES_RESTRICCION o deja que la traduzca el agente."
+        )
+    liquidez = str(c.liquidity_need).strip().lower()
+    riesgo = str(c.risk_tolerance).strip().lower()
+    if liquidez not in MIN_CAJA_POR_LIQUIDEZ or riesgo not in MAX_CAJA_POR_RIESGO:
+        print(
+            f"{c.client_id}: liquidez '{c.liquidity_need}' o riesgo '{c.risk_tolerance}' sin política; se usa la de nivel 'media'."
+        )
+        liquidez = liquidez if liquidez in MIN_CAJA_POR_LIQUIDEZ else "media"
+        riesgo = riesgo if riesgo in MAX_CAJA_POR_RIESGO else "media"
+    if MIN_CAJA_POR_LIQUIDEZ[liquidez] > 0:
+        reglas_c.append(
+            (
+                "MIN_CAJA",
+                {"limite": MIN_CAJA_POR_LIQUIDEZ[liquidez]},
+                f"Liquidez {c.liquidity_need}",
+                True,
+            )
+        )
+    reglas_c.append(
         (
             "MAX_CAJA",
-            {"limite": 0.10},
-            "Crecimiento de capital: se mantiene invertido",
+            {"limite": MAX_CAJA_POR_RIESGO[riesgo]},
+            f"Tolerancia {c.risk_tolerance}: se mantiene invertido",
             True,
-        ),
-        ("OBJETIVO", {"tipo": "max_retorno"}, "Crecimiento de capital", False),
-    ],
-    "CL_02": [
-        (
-            "MAX_GRUPO",
-            {"grupo": "alta_vol", "limite": 0.25},
-            "Máx. 25% en activos de alta volatilidad",
-            False,
-        ),
-        ("MIN_CAJA", {"limite": 0.10}, "Liquidez Media", True),
-        (
-            "MAX_CAJA",
-            {"limite": 0.60},
-            "Crecimiento moderado: al menos 40% invertido",
-            True,
-        ),
-        (
-            "OBJETIVO",
-            {"tipo": "max_retorno"},
-            "Preservación + crecimiento moderado",
-            False,
-        ),
-    ],
-    "CL_03": [
-        ("MIN_PAISES", {"n": 3, "peso_min": 0.05}, "Al menos 3 países", False),
-        ("MIN_SECTORES", {"n": 3, "peso_min": 0.05}, "y 3 sectores", False),
-        ("MIN_CAJA", {"limite": 0.05}, "Liquidez Media", True),
-        ("MAX_CAJA", {"limite": 0.30}, "Diversificación: se mantiene invertido", True),
-        ("OBJETIVO", {"tipo": "max_sharpe"}, "Diversificación geográfica", False),
-    ],
-}
+        )
+    )
+    prioridad = str(c.priority).lower()
+    objetivo = "max_sharpe" if "diversific" in prioridad else "max_retorno"
+    reglas_c.append(("OBJETIVO", {"tipo": objetivo}, c.priority, False))
+    return reglas_c
+
+
+# Un cliente con moneda sin tipo de cambio en 02_macro no se puede medir en su moneda: se omite con aviso
+clientes["base_currency"] = clientes["base_currency"].str.strip().str.upper()
+soportada = clientes["base_currency"].isin(["USD", *FX_COL])
+for c in clientes[~soportada].itertuples():
+    print(
+        f"OMITIDO {c.client_id}: moneda {c.base_currency} sin columna de tipo de cambio en 02_macro (FX_COL)."
+    )
+clientes = clientes[soportada].reset_index(drop=True)
+MANUALES = {c.client_id: reglas_desde_perfil(c) for c in clientes.itertuples()}
+for cid, rr in MANUALES.items():
+    print(cid, [(t, p) for t, p, _, _ in rr])
 
 # COMMAND ----------
 
@@ -1174,9 +1228,8 @@ ACCIÓN REQUERIDA: {t.required_action}"""
             valor += w * v
         return valor - 1
 
-    afectados = sorted(
-        set(tw.loc[tw["tipo"] == "Client", "client_id"].dropna()) | {CLIENTE_ELEGIDO}
-    )
+    # Todos los clientes: así cambiar de cliente en el dashboard no requiere volver a correr nada
+    afectados = list(clientes["client_id"])
     rec_tw, estres = [], []
     for cid in clientes["client_id"]:
         antes = resultados[cid]
@@ -1585,7 +1638,9 @@ HERRAMIENTAS["ver_opciones"] = lambda: a_texto(
 )
 OBLIGATORIAS.add("ver_opciones")
 
-instrucciones = f"""Eres analista de inversiones. Prepara el brief de la recomendación para el cliente {CLIENTE_ELEGIDO}.
+
+def instrucciones_para(CLIENTE_ELEGIDO):
+    return f"""Eres analista de inversiones. Prepara el brief de la recomendación para el cliente {CLIENTE_ELEGIDO}.
 Fecha de decisión: {FECHA_CORTE.date()}. Fuente de precios usada: {FUENTE}.
 Herramientas (una por paso, sin argumentos): {sorted(HERRAMIENTAS)}.
 Antes de entregar es OBLIGATORIO usar: {sorted(OBLIGATORIAS)}.
@@ -1613,6 +1668,7 @@ Responde SIEMPRE solo un JSON con una de estas formas:
   "recomendacion": [{{"texto": "", "tabla": ""}}],
   "riesgos_supuestos": [{{"texto": "", "tabla": ""}}]}}}}"""
 
+
 TABLA_DE = {
     "ver_recomendacion": {
         "gold_recomendacion_twist" if HAY_TWIST else "gold_recomendacion"
@@ -1627,15 +1683,46 @@ TABLA_DE = {
     "ver_opciones": {"gold_opciones_cliente"},
 }
 
+# Escalable: un brief por cliente (widget brief_clientes = "todos" o una lista "CL_01,CL_03").
+# HERRAMIENTAS filtra por la variable CLIENTE_ELEGIDO, que aquí toma el valor de cada cliente.
+CLIENTES_BRIEF = (
+    list(clientes["client_id"])
+    if BRIEF_CLIENTES == "todos"
+    else [c.strip() for c in BRIEF_CLIENTES.split(",") if c.strip()]
+)
+
+
+def alias_de(r):
+    # Patrones que cuentan como "mencionar" una posición en el brief
+    if r.asset_id == "CAJA":
+        return [r"CAJA(?!_)", r"dep[oó]sito (en )?USD", r"caja (en )?(USD|d[oó]lares)"]
+    if r.asset_id == "CAJA_LOCAL":
+        return [
+            r"CAJA_LOCAL",
+            rf"caja (en )?{r.moneda_cliente}",
+            r"caja local",
+            r"moneda local",
+        ]
+    return [
+        rf"{re.escape(r.asset_id)}",
+        re.escape(r.nombre),
+        rf"{re.escape(r.nombre.split()[0])}",
+    ]
+
+
+briefs, trazas = [], []
 if not AGENTE_ACTIVO:
     print("Agente desactivado, no se genera el brief. Motivo:", MOTIVO_AGENTE)
-else:
+for CLIENTE_ELEGIDO in CLIENTES_BRIEF if AGENTE_ACTIVO else []:
+    print(f"--- Brief {CLIENTE_ELEGIDO}")
     historial, traza, brief = "", [], None
     for paso in range(1, MAX_PASOS + 1):
         try:
             d = extraer_json(
                 preguntar(
-                    instrucciones + "\n\nHISTORIAL:\n" + (historial or "Ninguno.")
+                    instrucciones_para(CLIENTE_ELEGIDO)
+                    + "\n\nHISTORIAL:\n"
+                    + (historial or "Ninguno.")
                 ),
                 "{",
                 "}",
@@ -1661,7 +1748,9 @@ else:
             sin_mencion = [
                 r.nombre
                 for r in rec_final.itertuples()
-                if r.asset_id not in texto_rec and r.nombre not in texto_rec
+                # Alias por posición: código (como palabra completa), nombre o su primera palabra.
+                # Las dos cajas tienen alias propios para que "Caja" no cubra a ambas.
+                if not any(re.search(patron, texto_rec, re.I) for patron in alias_de(r))
             ]
             if OBLIGATORIAS <= usadas and sin_mencion:
                 historial += (
@@ -1726,13 +1815,13 @@ else:
                     "run_id": RUN_ID,
                 }
             )
-    df_brief = pd.DataFrame(filas)
     if brief is None:
-        print("El agente no entregó brief en", MAX_PASOS, "pasos.")
-    else:
-        guardar(df_brief, "gold_brief_cliente")
-        display(df_brief)
-    guardar(
-        pd.DataFrame(traza).assign(client_id=CLIENTE_ELEGIDO, run_id=RUN_ID),
-        "gold_traza_agente",
-    )
+        print(CLIENTE_ELEGIDO, "· el agente no entregó brief en", MAX_PASOS, "pasos.")
+    briefs += filas
+    trazas += [{**t, "client_id": CLIENTE_ELEGIDO, "run_id": RUN_ID} for t in traza]
+
+if briefs:
+    guardar(pd.DataFrame(briefs), "gold_brief_cliente")
+    display(pd.DataFrame(briefs))
+if trazas:
+    guardar(pd.DataFrame(trazas), "gold_traza_agente")
