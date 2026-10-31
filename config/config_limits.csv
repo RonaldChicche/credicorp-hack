@@ -1,0 +1,7 @@
+cliente,regla,tipo,valor,descripcion,twist_id,vigente_desde
+*,VOL_ALTA_UMBRAL,parametro,0.30,"Volatilidad anual desde la cual un activo es de alta volatilidad",BASE,2026-08-14
+*,VENTANA_SESIONES,parametro,126,"Sesiones que equivalen a 6 meses",BASE,2026-08-14
+CL_02,DD_MAX,limite,0.10,"Caída máxima tolerada, medida en la moneda base del cliente",BASE,2026-08-14
+CL_02,PESO_MAX_ALTA_VOL,limite,0.25,"Peso máximo sumado en activos de alta volatilidad",BASE,2026-08-14
+CL_02,NECESIDAD_6M,parametro,0.30,"Fracción de la cartera que se necesitará en 6 meses",TW_02,2026-08-17
+CL_02,P05_6M_MIN,limite,0.05,"Pérdida máxima (percentil 5 a 6 meses) del tramo de liquidez, en moneda base",TW_02,2026-08-17

@@ -1,7 +1,7 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Análisis de portafolio
-# MAGIC Usa las tablas `*_clean` generadas por `explorar_datos`. Cubre riesgo/retorno por activo,
+# MAGIC Usa las tablas `silver_*` generadas por `explorar_datos`. Cubre riesgo/retorno por activo,
 # MAGIC correlaciones, sensibilidad macro, régimen de riesgo, fundamentales, eventos y encaje con los perfiles de cliente.
 
 # COMMAND ----------
@@ -13,13 +13,14 @@ import matplotlib.pyplot as plt
 dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "credicorp_hack")
 T = f"{dbutils.widgets.get('catalog')}.{dbutils.widgets.get('schema')}"
+VOL_ALTA = float(spark.table(f"{T}.config_limits").filter("regla = 'VOL_ALTA_UMBRAL'").orderBy("vigente_desde").tail(1)[0].valor)
 
-px = spark.table(f"{T}.prices_daily_clean").toPandas()
-macro = spark.table(f"{T}.macro_clean").toPandas()
-fund = spark.table(f"{T}.fundamentals_clean").toPandas()
-assets = spark.table(f"{T}.assets").toPandas()
-clients = spark.table(f"{T}.clients").toPandas()
-events = spark.table(f"{T}.events").toPandas()
+px = spark.table(f"{T}.silver_prices_daily").toPandas()
+macro = spark.table(f"{T}.silver_macro").toPandas()
+fund = spark.table(f"{T}.silver_fundamentals").toPandas()
+assets = spark.table(f"{T}.silver_assets").toPandas()
+clients = spark.table(f"{T}.silver_clients").toPandas()
+events = spark.table(f"{T}.silver_events").toPandas()
 
 px["date"] = pd.to_datetime(px.date)
 macro["date"] = pd.to_datetime(macro.date)
@@ -171,7 +172,7 @@ display(pd.DataFrame(rows).round(4))
 
 meta = assets.set_index("asset_id")
 vol = stats.vol_anual
-high_vol = set(vol[vol >= vol.quantile(2 / 3)].index)  # tercil superior = "alta volatilidad"
+high_vol = set(vol[vol > VOL_ALTA].index)  # alta volatilidad = umbral de config_limits
 
 
 def inv_vol_weights(ids):
@@ -252,6 +253,6 @@ def save(df, name):
     spark.createDataFrame(df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{T}.{name}")
 
 
-save(stats.reset_index(), "analysis_asset_stats")
-save(pd.DataFrame(summary), "analysis_client_summary")
-save(pd.DataFrame(weights_rows), "analysis_client_weights")
+save(stats.assign(alta_vol=stats.vol_anual > VOL_ALTA).reset_index(), "gold_asset_stats")
+save(pd.DataFrame(summary), "gold_client_summary")
+save(pd.DataFrame(weights_rows), "gold_client_weights")
