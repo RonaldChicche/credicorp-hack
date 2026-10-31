@@ -1,0 +1,5 @@
+cliente,grupo,peso,twist_id,vigente_desde
+CL_02,preservacion,0.35,SCORE_V1,2026-08-17
+CL_02,liquidez_6m,0.30,SCORE_V1,2026-08-17
+CL_02,crecimiento,0.20,SCORE_V1,2026-08-17
+CL_02,riesgo_externo,0.15,SCORE_V1,2026-08-17

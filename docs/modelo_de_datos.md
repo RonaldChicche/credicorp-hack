@@ -86,15 +86,15 @@ erDiagram
 
 | CSV crudo | Tabla limpia | Grano | Clave | Filas (crudo → limpio) | Cobertura |
 |---|---|---|---|---|---|
-| `01_market_prices_raw.csv` | `prices_daily_clean` | activo × día | `(date, asset_id)` | 2 175 → 2 168 | 2025-08-01 a 2026-08-14 |
-| `01_market_prices_raw_expanded.csv` | `prices_intraday_clean` | activo × barra de 10 min | `(date, asset_id)` | 538 836 → 538 800 | 2020-01-02 a 2026-08-14 |
-| `02_macro_raw.csv` | `macro_clean` | día | `date` | 271 → 271 | 2025-08-01 a 2026-08-14 |
-| `03_fundamentals_raw.csv` | `fundamentals_clean` | emisor × trimestre | `(issuer_id, period_end)` | 65 → 63 | 2024-09-30 a 2026-06-30 |
-| `04_asset_reference.csv` | `assets` | activo | `asset_id` | 8 | n/a |
-| `05_client_profiles.csv` | `clients` | cliente | `client_id` | 3 | n/a |
-| `06_events.csv` | `events` | evento | n/a | 5 | 2026-02-10 a 2026-07-21 |
+| `01_market_prices_raw.csv` | `silver_prices_daily` | activo × día | `(date, asset_id)` | 2 175 → 2 168 | 2025-08-01 a 2026-08-14 |
+| `01_market_prices_raw_expanded.csv` | `silver_prices_intraday` | activo × barra de 10 min | `(date, asset_id)` | 538 836 → 538 800 | 2020-01-02 a 2026-08-14 |
+| `02_macro_raw.csv` | `silver_macro` | día | `date` | 271 → 271 | 2025-08-01 a 2026-08-14 |
+| `03_fundamentals_raw.csv` | `silver_fundamentals` | emisor × trimestre | `(issuer_id, period_end)` | 65 → 63 | 2024-09-30 a 2026-06-30 |
+| `04_asset_reference.csv` | `silver_assets` | activo | `asset_id` | 8 | n/a |
+| `05_client_profiles.csv` | `silver_clients` | cliente | `client_id` | 3 | n/a |
+| `06_events.csv` | `silver_events` | evento | n/a | 5 | 2026-02-10 a 2026-07-21 |
 
-Tablas derivadas: `dq_log` (correcciones aplicadas), `analysis_asset_stats`, `analysis_client_summary`, `analysis_client_weights`.
+Tablas derivadas: `dq_log` (correcciones aplicadas), `gold_asset_stats`, `gold_client_summary`, `gold_client_weights`.
 
 ## Relaciones
 
@@ -181,18 +181,37 @@ Nota: los cierres de `prices_intraday` difieren de los de `prices_daily` en prom
 
 ## Cómo está guardado en Databricks
 
-Esquema `workspace.credicorp_hack`: 12 tablas Delta *managed*. Se leyó de `information_schema` el 2026-10-31.
+Esquema `workspace.credicorp_hack`: 19 tablas Delta *managed*. Se leyó de `information_schema` el 2026-10-31.
 
 - Las claves de las tablas de arriba son **lógicas**: Delta no tiene PK/FK definidas y todas las columnas aceptan nulos. La unicidad la garantiza el notebook de limpieza.
 - Las columnas de fecha (`date`, `event_date`, `period_end`) están guardadas como `TIMESTAMP` a las 00:00, no como `DATE`. Usa `CAST(date AS DATE)` al comparar.
 - Ninguna tabla ni columna tiene `comment` en Unity Catalog.
+- Nombres por capa: `silver_` (datos limpios), `gold_` (resultados que consume el dashboard) y `config_` (parámetros del score). Los CSV crudos del volumen `raw` son la capa bronze.
 - Tablas de análisis (escritas por los notebooks de `notebooks/analisis/`):
 
 | Tabla | Filas | Grano | Notebook |
 |---|---|---|---|
-| `analysis_asset_stats` | 8 | activo | `analisis_portafolio` |
-| `analysis_client_summary` | 3 | cliente | `analisis_portafolio` |
-| `analysis_client_weights` | 21 | cliente × activo | `analisis_portafolio` |
-| `analysis_twist_summary` | 3 | novedad del twist | `analisis_twist` |
+| `gold_asset_stats` | 8 | activo | `analisis_portafolio` |
+| `gold_client_summary` | 3 | cliente | `analisis_portafolio` |
+| `gold_client_weights` | 21 | cliente × activo | `analisis_portafolio` |
+| `gold_twist_summary` | 3 | novedad del twist | `analisis_twist` |
 
 Versión navegable con buscador de columnas: https://claude.ai/artifact/UWy6UGAk6AvYfH7btANJdo (privada; solo la abre quien tenga acceso).
+
+## Score por cliente
+
+`notebooks/score/00_cargar_config.py` lee `config/*.csv`, valida y escribe `config_limits`, `config_weights` y `config_indicators`.
+`notebooks/score/01_calcular_score.py` los usa para evaluar cada cartera candidata de un cliente.
+
+1. **Filtro:** si la cartera incumple un límite duro, queda no apta y no recibe score total.
+2. **Score:** cada indicador va de 0 a 100 entre `ancla_0` y `ancla_100`; el grupo es el promedio de sus indicadores y el total pondera los grupos.
+
+| Tabla | Filas | Grano | Para qué |
+|---|---|---|---|
+| `gold_score_results` | 2 | cliente × cartera | Apta o no, límites incumplidos, score por grupo y total. **La lee el dashboard** |
+| `gold_score_detail` | 10 | cliente × cartera × indicador | Valor, anclas y score de cada indicador |
+| `gold_limit_checks` | 6 | cliente × cartera × límite | Valor medido frente al límite |
+| `gold_portfolio_weights` | 8 | cliente × cartera × activo | Composición de cada cartera |
+
+Un twist nuevo se aplica agregando filas a los CSV de `config/` con otro `twist_id` y `vigente_desde`: por cada clave gana la fila más reciente y las anteriores quedan como historial.
+Hoy solo CL_02 tiene configuración.

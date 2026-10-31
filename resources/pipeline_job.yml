@@ -3,6 +3,13 @@ resources:
     pipeline_job:
       name: credicorp_pipeline_${bundle.target}
       tasks:
+        - task_key: config
+          notebook_task:
+            notebook_path: ../notebooks/score/00_cargar_config.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
         - task_key: limpieza
           notebook_task:
             notebook_path: ../notebooks/exploracion/explorar_datos.py
@@ -13,6 +20,7 @@ resources:
         - task_key: analisis
           depends_on:
             - task_key: limpieza
+            - task_key: config
           notebook_task:
             notebook_path: ../notebooks/analisis/analisis_portafolio.py
             base_parameters:
@@ -24,6 +32,16 @@ resources:
             - task_key: analisis
           notebook_task:
             notebook_path: ../notebooks/analisis/analisis_twist.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
+        - task_key: score
+          depends_on:
+            - task_key: analisis
+            - task_key: config
+          notebook_task:
+            notebook_path: ../notebooks/score/01_calcular_score.py
             base_parameters:
               catalog: ${var.catalog}
               schema: credicorp_hack

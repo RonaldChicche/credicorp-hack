@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Exploración y limpieza de datos
 # MAGIC Lee los CSV crudos del volumen `/Volumes/<catalog>/<schema>/raw`, documenta los problemas de
-# MAGIC calidad, los corrige y escribe tablas Delta `*_clean` + `dq_log` (qué se corrigió y cuántas filas).
+# MAGIC calidad, los corrige y escribe tablas Delta `silver_*` (qué se corrigió y cuántas filas).
 
 # COMMAND ----------
 
@@ -257,14 +257,14 @@ def save(df, name):
 
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET}")
-save(prices_c, "prices_daily_clean")
-save(intraday_c, "prices_intraday_clean")
-save(macro_c, "macro_clean")
-save(fund_c, "fundamentals_clean")
-save(assets_c, "assets")
-save(clients, "clients")
-save(events_c, "events")
-save(pd.DataFrame(dq_log, columns=["tabla", "regla", "filas_afectadas"]), "dq_log")
+save(prices_c, "silver_prices_daily")
+save(intraday_c, "silver_prices_intraday")
+save(macro_c, "silver_macro")
+save(fund_c, "silver_fundamentals")
+save(assets_c, "silver_assets")
+save(clients, "silver_clients")
+save(events_c, "silver_events")
+save(pd.DataFrame(dq_log, columns=["tabla", "regla", "filas_afectadas"]), "silver_dq_log")
 
 # COMMAND ----------
 
@@ -272,7 +272,7 @@ save(pd.DataFrame(dq_log, columns=["tabla", "regla", "filas_afectadas"]), "dq_lo
 
 # COMMAND ----------
 
-display(spark.table(f"{TARGET}.dq_log").filter("filas_afectadas > 0"))
+display(spark.table(f"{TARGET}.silver_dq_log").filter("filas_afectadas > 0"))
 
 # COMMAND ----------
 
