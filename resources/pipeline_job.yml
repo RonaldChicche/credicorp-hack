@@ -19,6 +19,15 @@ resources:
               catalog: ${var.catalog}
               schema: credicorp_hack
           environment_key: default
+        - task_key: analisis_twist
+          depends_on:
+            - task_key: analisis
+          notebook_task:
+            notebook_path: ../notebooks/analisis/analisis_twist.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: credicorp_hack
+          environment_key: default
       environments:
         - environment_key: default
           spec:

@@ -163,3 +163,18 @@ Cifras trimestrales en millones de USD: `revenue_usd_m`, `ebitda_usd_m`, `net_in
 | Filas intradía sin OHLC | intradía | Descartar |
 
 El conteo exacto de cada corrección queda en la tabla `dq_log`.
+
+## Twist (`dataset_twist.csv`)
+
+Archivo adicional con novedades posteriores al corte de los datos (2026-08-14). Vive en el volumen como `dataset_twist.csv`; lo consume `notebooks/analisis/analisis_twist.py`.
+
+| Columna | Notas |
+|---|---|
+| `release_id` | `TW_01` … `TW_03` |
+| `effective_date` | 2026-08-17 |
+| `type` | `Macro`, `Client`, `FX` |
+| `field` | Variable afectada (`us_10y_yield`, `CL_02_liquidity`, `USD_COP`) |
+| `new_information` | La novedad en texto |
+| `required_action` | Lo que debe analizarse |
+
+Nota: los cierres de `prices_intraday` difieren de los de `prices_daily` en promedio ~14% (comparando el último cierre de cada día), por lo que no son la misma serie y no se combinan.

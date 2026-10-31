@@ -179,18 +179,20 @@ def inv_vol_weights(ids):
     return w / w.sum()
 
 
-def cap_group(w, groups, cap):
-    """Limita el peso por grupo reasignando el exceso al resto (iterativo)."""
+def cap_group(w, groups, cap, capped=None):
+    """Limita el peso de los grupos en `capped` (todos si es None) reasignando el exceso al resto (iterativo)."""
     w = w.copy()
     for _ in range(50):
         g = w.groupby(groups.reindex(w.index)).sum()
-        over = g[g > cap + 1e-9]
+        over = g[(g > cap + 1e-9) & (g.index.isin(capped) if capped is not None else True)]
         if over.empty:
             break
         for grp in over.index:
             members = groups.reindex(w.index) == grp
             w[members] *= cap / g[grp]
         free = w.index[~groups.reindex(w.index).isin(over.index)]
+        if len(free) == 0:
+            break
         w[free] += (1 - w.sum()) * w[free] / w[free].sum()
     return w
 
@@ -206,7 +208,8 @@ def build(client):
         w = cap_group(w, meta.sector, 0.45)
     elif "alta volatilidad" in c:
         hv = pd.Series({a: "alta" if a in high_vol else "resto" for a in w.index})
-        w = cap_group(w, hv, 0.25)
+        w = cap_group(w, hv, 0.25, capped=["alta"])
+    assert abs(w.sum() - 1) < 1e-6, f"{client.client_id}: los pesos suman {w.sum():.3f}"
     port = (ret[w.index] * w).sum(axis=1)
     dd = max_drawdown(port)
     ok = {
