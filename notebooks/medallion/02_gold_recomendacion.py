@@ -633,6 +633,8 @@ def optimizar(
         [r["params"]["limite"] for r in restricciones if r["rule_type"] == "MAX_CAJA"],
         default=1.0,
     )
+    # Reglas contradictorias (mínimo > tope): se muestrea en el mínimo y la evaluación lo marcará como incumplido
+    hi = max(hi, lo)
     caja = rng.uniform(lo, hi, n)
     resto = np.vstack(
         [
@@ -989,7 +991,7 @@ ACCIÓN REQUERIDA: {t.required_action}"""
         ]
         reglas_twist = pd.concat([reglas_twist, pd.DataFrame([n_])], ignore_index=True)
         # Si la nueva liquidez mínima supera el tope de caja vigente, el tope se sube (y queda registrado)
-        if n_["rule_type"] == "MIN_CAJA":
+        if n_["rule_type"] in ("MIN_CAJA", "MIN_CAJA_LOCAL"):
             tope = (reglas_twist["client_id"] == n_["client_id"]) & (
                 reglas_twist["rule_type"] == "MAX_CAJA"
             )
