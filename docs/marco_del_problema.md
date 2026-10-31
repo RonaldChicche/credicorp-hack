@@ -86,6 +86,8 @@ El score ordena carteras que ya pasaron el filtro. Un puntaje alto en un grupo n
 
 ### Carteras que se comparan
 
+Hay dos carteras de referencia armadas con una heurística (abajo), y una **simulación** que busca las mejores (sección 7).
+
 - `actual`: la cartera base de CL_02 (`gold_client_weights`), ponderada por inverso de la volatilidad sobre los activos elegibles. El 30% se obtendría vendiendo a prorrata.
 - `dividida`: 70% de la cartera actual + 30% en un tramo de liquidez formado por los 3 activos con menor volatilidad, menor drawdown y mayor liquidez combinados. El ranking es por riesgo, no por retorno pasado.
 
@@ -96,7 +98,7 @@ El score ordena carteras que ya pasaron el filtro. Un puntaje alto en un grupo n
 | `actual` | -11.1% | -2.0% | 0% | No |
 | `dividida` | -10.96% | -1.0% | 0% | No |
 
-Ninguna cartera candidata cumple el límite de -10% de drawdown en COP; la diferencia con el drawdown en USD la causa el tipo de cambio.
+Ninguna de estas dos carteras de referencia cumple el límite de -10% de drawdown en COP; la diferencia con el drawdown en USD la causa el tipo de cambio (la simulación de la sección 7 sí encuentra carteras que lo cumplen).
 Por eso `gold_score_results.score_total` es nulo en ambas. Los scores por grupo sí se calculan:
 
 | Cartera | Preservación | Liquidez 6m | Crecimiento | Riesgo externo |
@@ -106,14 +108,34 @@ Por eso `gold_score_results.score_total` es nulo en ambas. Los scores por grupo 
 
 Como referencia, sin aplicar el filtro los totales serían ~69 y ~71; el sistema no los publica porque las carteras no son aptas.
 
-## 7. Cómo se aplica un twist nuevo
+## 7. Simulación de portafolios
+
+`notebooks/score/02_simular_portafolios.py` responde qué carteras se le pueden recomendar. Cada cartera son dos vectores de pesos sobre las 8 acciones:
+el **núcleo** (70%) y el **tramo de liquidez** (30%). El notebook:
+
+1. Genera 100.000 carteras al azar (mezcla de concentradas y diversificadas) y las evalúa en COP con los indicadores y límites de la configuración.
+2. Refina: perturba las 200 mejores durante 15 rondas y conserva las que mejoran.
+3. Ordena: primero las que cumplen todos los límites, por `score_total`; si faltan, las de menor violación.
+
+Antes de correr comprueba que su evaluación coincide con `gold_score_detail` hasta 1e-9, para que haya una sola definición de cada indicador.
+
+**Resultado (semilla 42):** de 130.000 carteras evaluadas, **14.482 (11.1%) cumplen los tres límites**; el mejor drawdown hallado es -9.05% (el límite es -10%).
+Es decir, el límite sí es alcanzable: lo que fallaba eran las dos carteras de referencia, no el límite. Las 50 mejores tienen score total entre 73.7 y 73.8.
+
+**Cómo leerlo**
+- Las 50 candidatas son casi intercambiables en score pero con pesos muy distintos: el score no identifica una única cartera óptima, solo una región de carteras buenas.
+- Todo se calcula sobre el mismo año de datos con el que se eligen las carteras, así que el retorno histórico favorece a las acciones que mejor les fue (Aurora Health pesa mucho).
+- No hay límite de concentración en la configuración: la mejor candidata pone el 69% del tramo de liquidez en una sola acción. Si el cliente no lo acepta, hay que agregar un límite de peso máximo por activo en `config_limits`.
+- La búsqueda es aleatoria: no prueba que no exista una cartera mejor.
+
+## 8. Cómo se aplica un twist nuevo
 
 La configuración vive en `config/*.csv` y se carga a `config_limits`, `config_weights` y `config_indicators`. Un twist nuevo es agregar filas con otro `twist_id` y `vigente_desde`:
 por cada clave gana la fila más reciente y las anteriores quedan como historial. El código no cambia.
 
 Lo que sí requiere código es un **indicador nuevo** (hay que escribir su fórmula una vez) y un **cliente nuevo**, que necesita sus propios límites, pesos y anclas.
 
-## 8. Limitaciones
+## 9. Limitaciones
 
 - **Poca historia:** hay un año de datos diarios (ago-2025 a ago-2026) y 8 acciones. El score distingue poco entre carteras parecidas y las ventanas de 6 meses se solapan mucho.
 - **Choques fuera de rango:** `usd_cop` se movió unos 6.5% en el año y el 10 años no superó los 30 pb en una semana. Los choques del twist son escenarios por extrapolación, no predicciones.
